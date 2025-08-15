@@ -1,6 +1,10 @@
-Flask
-stripe
-gunicorn
+Flask==3.0.2
+flask-cors==4.0.1
+gunicorn==22.0.0
+stripe==9.11.0
+google-cloud-firestore==2.16.0
+google-auth==2.31.0
+
 
 
 
