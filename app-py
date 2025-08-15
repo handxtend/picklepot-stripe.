@@ -49,7 +49,7 @@ def create_checkout_session():
 
     amount = int(data["amount_cents"])
     if amount < 50:
-        return jsonify({"error":"Minimum is 50¢"}), 400
+        return jsonify({"error":"Minimum is 50Â¢"}), 400
 
     try:
         session = stripe.checkout.Session.create(
