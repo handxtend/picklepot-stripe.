@@ -1,0 +1,410 @@
+﻿DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>PiCo Pickle Pot</title>
+  <link rel="icon" href="favicon.ico"/>
+
+  <!-- Banner CSS -->
+  <style>
+    .ad-slot{display:flex;justify-content:center;margin:12px 0}
+    .ad-slot a{display:inline-block;line-height:0}
+    .ad-slot img{max-width:100%;height:auto;border-radius:8px;border:1px solid var(--border);background:#fff}
+    .sponsored-tag{font-size:12px;color:var(--muted);text-align:center;margin-top:4px}
+  </style>
+
+  <!-- Base styles -->
+  <style>
+    :root{
+      --accent:#b6d43c; --ink:#0e1628; --text:#1f2937; --muted:#6b7280;
+      --bg:#f3f4f6; --card:#ffffff; --border:#e5e7eb;
+      --gold:#f8e48c;
+    }
+    *{box-sizing:border-box}
+    html,body{height:100%}
+    /* OUTER stays black now */
+    body{margin:0;font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial;background:#000;color:var(--text)}
+    /* Inner container keeps original look */
+    .wrap{max-width:960px;margin:20px auto;padding:16px;background:var(--bg);border-radius:10px}
+
+    .topbar{/* tagline bump */
+
+      display:flex;flex-direction:column;align-items:center;justify-content:center;
+      gap:10px;border-bottom:1px solid var(--border);padding:16px 0;margin-bottom:12px;text-align:center;
+    }
+    .topbar .logo{display:block;height:clamp(120px,20vw,220px);width:auto;object-fit:contain;background:transparent}
+    h1,h2{margin:.2em 0;color:var(--ink)} h1{font-size:28px} small{color:var(--muted)}
+    small.muted{font-size:1.1rem;font-weight:700;}
+.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px;margin-bottom:16px;box-shadow:0 1px 2px rgba(0,0,0,.04)}
+    label{font-size:14px;display:block;margin:8px 0 4px;color:var(--ink);font-weight:700}
+    input,select{width:100%;padding:10px;border:1px solid #000;border-radius:10px;background:#fff;color:var(--text)}
+    input::placeholder{color:#9ca3af}
+    .row{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+    .grid2{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:end}
+    .btn{background:#f8fafc;border:1px solid var(--border);border-radius:10px;color:#000;padding:10px 14px;cursor:pointer}
+    .btn:hover{background:#eef2f7}
+    .btn.primary{background:var(--accent);border-color:var(--accent);color:#101010;font-weight:700}
+    .btn.primary:hover{filter:brightness(.96)}
+    .btn.danger{background:#fff0f0;border-color:#ef4444;color:#b91c1c}
+    table{width:100%;border-collapse:separate;border-spacing:0 8px}
+    th{font-weight:600;color:var(--ink);text-align:left}
+    td{background:#fff;border:1px solid var(--border);padding:8px;border-radius:8px;color:#var(--text)}
+    .pill{background:#fff;border:1px solid var(--border);padding:6px 10px;border-radius:999px;color:#000}
+    .muted{color:var(--muted)}
+    .foot{padding:28px 0;text-align:center;color:var(--muted)}
+    .alert{border:1px solid #f59e0b;background:#fffbeb;color:#92400e;padding:10px 12px;border-radius:10px;margin:8px 0}
+    .alert.success{border-color:#34d399;background:#ecfdf5;color:#065f46}
+    .inline{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+    .pill-cost{display:inline-block;padding:4px 8px;border:1px solid var(--border);border-radius:999px;font-weight:600}
+    .warn{color:#b91c1c;font-weight:600}
+    .big-totals b{font-weight:800}
+    .btn.xl{padding:16px 26px;font-weight:800;font-size:18px;border-radius:14px}
+    .badge{display:inline-block;padding:4px 10px;border-radius:999px;border:1px solid var(--border);font-weight:700}
+    .badge.warn{background:#fff7ed;border-color:#fdba74;color:#9a3412}
+
+    .section-header{
+      background-color:#003366;color:#ffffff;
+      padding:10px 15px;border-radius:5px 5px 0 0;
+      font-size:1.2em;font-weight:700;margin-top:0;margin-bottom:12px;
+    }
+
+    .pot-highlight{background-color:var(--gold);color:#000;padding:4px 10px;border-radius:6px;display:inline-block}
+    .soft-blue-box{background-color:#d9ecff;color:#000;padding:6px 10px;border-radius:8px;border:1px solid #bcd9ff;display:inline-block}
+
+    .status-chip{display:inline-block;padding:6px 10px;border-radius:999px;border:1px solid var(--border);color:#000}
+    .status-chip.open{background:#d1fae5;border-color:#a7f3d0}
+    .status-chip.closed{background:#fee2e2;border-color:#fecaca}
+    .status-chip.hold{background:#fff7ed;border-color:#fde68a}
+
+    .entry-status{color:#000!important;font-weight:600;text-transform:capitalize}
+    .entry-status.active{background:#d1fae5!important;border-color:#a7f3d0!important}
+    .entry-status.hold{background:#fff7ed!important;border-color:#fde68a!important}
+    .entry-status.inactive{background:#fee2e2!important;border-color:#fecaca!important}
+
+    /* Join button light gold */
+    #btn-join.btn{background:var(--gold);border-color:var(--gold);color:#000}
+    #btn-join.btn:hover{filter:brightness(.97)}
+
+    /* Tips bar: black background, white text */
+#btn-create.btn, #btn-load.btn{padding:16px 26px;font-weight:800;font-size:18px;border-radius:14px}
+    .tips-bar{background:#000;color:#fff;border:1px solid #222;padding:8px 12px;border-radius:8px;margin:10px 0 8px;font-size:14px text-align:center; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+
+    <!-- Header -->
+    <div class="topbar">
+      <img class="logo" src="Picklepot-logo.png" alt="Pickle Pot Logo"/>
+      <div>
+        <h1>PiCo Pickle Pot</h1>
+        <small class="muted">Win or Lose...Learn.</small>
+      </div>
+      <div style="margin-left:auto;display:flex;gap:8px;align-items:center">
+        <button class="btn" id="site-admin-toggle">Admin Login</button>
+        <button class="btn" id="site-admin-logout" style="display:none">Logout</button>
+        <small class="muted" id="site-admin-status" style="white-space:nowrap"></small>
+      </div>
+    </div>
+
+    <!-- Tips (black with white text) -->
+    
+
+    <!-- Payment success banner (hidden by default) -->
+    <div id="pay-banner" class="alert success" style="display:none"></div>
+
+    <!-- TOP SPONSOR BANNER -->
+    <div id="ad-top" class="ad-slot" aria-label="Sponsored" style="display:none"></div>
+    <div id="ad-top-meta" class="sponsored-tag" style="display:none">Sponsored</div>
+<div class="tips-bar" id="tipsBar" role="status" aria-live="polite">
+      <strong>Tip:</strong> <span id="tipText">Use the Active Tournaments list to pick your event.</span>
+    </div>
+<!-- Organizer subscription button (placed under Tips bar) -->
+    <div style="display:flex;justify-content:center;margin:8px 0 12px">
+      <button class="btn primary" id="btn-subscribe-organizer" title="Subscribe as an Organizer">Organizer Subscription</button>
+    </div>
+    <div class="sponsored-tag" style="margin-top:-6px;text-align:center">Subscribe to create & manage your own Pots</div>
+
+
+    <div class="alert" id="configWarning" style="display:none">
+      Firebase isn’t configured yet. Paste your Firebase config below, then reload.
+    </div>
+
+    <!-- ======= CREATE POT ======= -->
+    <section class="card admin-only" id="create-card" style="display:none">
+      <h2 class="section-header">Create a Pot</h2>
+      <div class="row">
+        <div><label>Tournament Name</label><select id="c-name-select"></select></div>
+        <div id="c-name-other-wrap" style="display:none"><label>Other Tournament Name</label><input id="c-name-other" placeholder="Enter tournament name"/></div>
+
+        <div><label>Organizer</label><select id="c-organizer"><option>Pickleball Compete</option><option>Other</option></select></div>
+        <div id="c-org-other-wrap" style="display:none"><label>Other Organizer</label><input id="c-org-other" placeholder="Organizer name"/></div>
+
+        <div><label>Event</label><select id="c-event"></select></div>
+        <div id="c-event-other-wrap" style="display:none"><label>Other Event</label><input id="c-event-other" placeholder="Event name"/></div>
+
+        <div><label>Skill Level</label><select id="c-skill"></select></div>
+        <div id="c-skill-other-wrap" style="display:none"><label>Other Skill</label><input id="c-skill-other" placeholder="Describe skill level"/></div>
+
+        <div><label>Member buy-in ($)</label><input id="c-buyin-m" type="number" min="0" step="0.01" placeholder="10"/></div>
+        <div><label>Guest buy-in ($)</label><input id="c-buyin-g" type="number" min="0" step="0.01" placeholder="15"/></div>
+
+        <div><label>Pot Percentage (%)</label><input id="c-pot-pct" type="number" min="0" max="100" step="1" placeholder="100"/></div>
+        <div></div>
+
+        <div><label>Date</label><input id="c-date" type="date"/></div>
+        <div><label>Time</label><input id="c-time" type="time"/></div>
+        <div><label>End Time (optional)</label><input id="c-end-time" type="time" placeholder="e.g., 16:00"/></div>
+
+        <div><label>Location</label><select id="c-location-select"></select></div>
+        <div id="c-location-other-wrap" style="display:none"><label>Other Location</label><input id="c-location-other" placeholder="Enter location"/></div>
+
+        <div class="row" style="margin-top:8px">
+          <div><label>Allow Stripe (card)</label><select id="c-allow-stripe"><option value="yes">Allowed</option><option value="no">Not allowed</option></select></div>
+          <div><label>Zelle Info (optional)</label><input id="c-pay-zelle" placeholder="e.g., name / phone / email"/></div>
+          <div><label>CashApp Info (optional)</label><input id="c-pay-cashapp" placeholder="$YourCashtag"/></div>
+          <div><label>Onsite Payment</label><select id="c-pay-onsite"><option value="yes">Allowed</option><option value="no">Not allowed</option></select></div>
+        </div>
+
+        <div class="inline" style="margin-top:12px">
+          <button class="btn primary" id="btn-create">Create Pot</button>
+          <div class="muted" id="create-result"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ======= JOIN A POT ======= -->
+    <section class="card">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px">
+        <h2 class="section-header" style="margin-bottom:0">Join a Pot</h2>
+        <div class="inline" id="auth-controls" style="margin-left:8px">
+          <button class="btn" id="btn-signin">Sign In</button>
+          <button class="btn" id="btn-signout" style="display:none">Sign Out</button>
+          <small class="muted" id="auth-user" style="display:none"></small>
+        </div>
+        <div id="j-header-right" style="text-align:right">
+          <div class="big-totals" id="j-pot-totals-big" style="font-size:28px;line-height:1.2">
+            <div><span class="muted">Pot Paid:</span> <b id="j-big-paid-amt" class="pot-highlight">$0.00</b></div>
+            <div><span class="muted">Pot Total:</span> <b id="j-big-total-amt" class="pot-highlight">$0.00</b></div>
+          </div>
+        </div>
+      </div>
+
+      <h3 style="margin:14px 0 6px">Active Tournaments</h3>
+
+      <div class="row">
+        <div style="flex:1">
+          <label style="display:none">Active Tournaments</label>
+          <select id="j-pot-select"></select>
+          <div class="muted" style="margin-top:6px">Summary: <span id="j-pot-summary-brief" class="soft-blue-box">—</span></div>
+          <div id="j-started-badge" class="badge warn" style="display:none;margin-top:6px">Tournament Started</div>
+        </div>
+        <div><label>&nbsp;</label><button class="btn" id="j-refresh">Refresh</button></div>
+      </div>
+
+      <div id="j-pot-total" class="pot-highlight" style="margin-top:6px;display:none">Total Pot: $0</div>
+
+      <div class="row" style="margin-top:12px">
+        <div><label>First Name</label><input id="j-fname" placeholder="First name"/></div>
+        <div><label>Last Name</label><input id="j-lname" placeholder="Last name"/></div>
+        <div><label>Email</label><input id="j-email" type="email" placeholder="you@example.com"/></div>
+        <div><label>Member / Guest</label><select id="j-mtype"><option value="Member">Member</option><option value="Guest">Guest</option></select><div id="j-cost" class="pill-cost" style="margin-top:6px">Cost: —</div></div>
+        <div><label>Skill Level</label><select id="j-skill"></select></div>
+        <div><label>Payment Type</label><select id="j-paytype"></select></div>
+      </div>
+
+      <div class="alert" id="j-pay-notes" style="display:none"></div>
+      <p class="muted" style="margin:8px 0 0">Note: Lower-skilled players can play up, but higher-skilled players <b>CANNOT</b> play down.</p>
+      <p class="muted" style="margin:4px 0 0">When paying, please put your <b>FULL NAME</b> in the payment notes.</p>
+      <div class="muted" id="j-warn" style="margin-top:8px;display:none"></div>
+
+      <div class="inline" style="margin-top:12px">
+        <button class="btn xl primary" id="btn-join" disabled>Join</button>
+        <span class="muted" id="join-msg"></span>
+      </div>
+    </section>
+
+    <!-- ======= POT DETAIL ======= -->
+    <section class="card">
+      <h2 class="section-header">Pot Details</h2>
+      <div class="grid2">
+        <input id="v-pot" placeholder="Pot ID to load"/>
+        <button class="btn primary" id="btn-load">Load</button>
+      </div>
+
+      <div id="pot-info" style="margin-top:12px;display:none">
+        <div style="display:flex;flex-wrap:wrap;gap:8px;margin:8px 0">
+          <span class="pill soft-blue-box" id="pi-name"></span>
+          <span class="pill soft-blue-box" id="pi-event"></span>
+          <span class="pill soft-blue-box" id="pi-skill"></span>
+          <span class="pill soft-blue-box" id="pi-when"></span>
+          <span class="pill soft-blue-box" id="pi-when-end"></span>
+          <span class="pill soft-blue-box" id="pi-location"></span>
+          <span class="pill soft-blue-box" id="pi-organizer"></span>
+          <span class="pill status-chip" id="pi-status"></span>
+          <span class="pill soft-blue-box admin-only" id="pi-id" style="display:none"></span>
+        </div>
+
+        <h3 style="margin:14px 0 6px">Registrations</h3>
+        <div style="overflow:auto">
+          <table id="adminTable">
+            <thead>
+              <tr>
+                <th style="min-width:160px">Name</th>
+                <th style="min-width:220px">Email</th>
+                <th>Type</th>
+                <th>Buy-in</th>
+                <th>Paid</th>
+                <th>Status</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+
+        <section class="admin-only" id="pot-admin" style="display:none; margin-top:16px;">
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <strong>Admin</strong>
+            <button class="btn" id="btn-admin-login">Admin Login</button>
+            <button class="btn" id="btn-edit">Edit Pot</button>
+            <button class="btn" id="btn-hold">Put on Hold</button>
+            <button class="btn" id="btn-resume">Resume</button>
+            <button class="btn danger" id="btn-delete">Delete Pot</button>
+            <button class="btn" id="btn-admin-grant">Grant this device co-admin</button>
+            <button class="btn" id="btn-admin-revoke">Revoke this device</button>
+          </div>
+
+          <div class="muted" id="admin-uids" style="margin-top:6px;"></div>
+
+          <!-- Edit form -->
+          <form id="pot-edit-form" style="display:none; margin-top:12px; border:1px solid var(--border);padding:12px;border-radius:8px;">
+            <div class="row">
+              <div><label>Tournament Name</label><select id="f-name-select"></select></div>
+              <div id="f-name-other-wrap" style="display:none"><label>Other Tournament Name</label><input id="f-name-other"/></div>
+
+              <div><label>Organizer</label><select id="f-organizer"><option>Pickleball Compete</option><option>Other</option></select></div>
+              <div id="wrap-organizer-other" style="display:none"><label>Other Organizer</label><input id="f-organizer-other"/></div>
+
+              <div><label>Event</label><select id="f-event"></select></div>
+              <div id="f-event-other-wrap" style="display:none"><label>Other Event</label><input id="f-event-other"/></div>
+
+              <div><label>Skill Level</label><select id="f-skill"></select></div>
+              <div id="f-skill-other-wrap" style="display:none"><label>Other Skill</label><input id="f-skill-other"/></div>
+
+              <div><label>Member buy-in ($)</label><input id="f-buyin-member" type="number" min="0" step="0.01"/></div>
+              <div><label>Guest buy-in ($)</label><input id="f-buyin-guest" type="number" min="0" step="0.01"/></div>
+
+              <div><label>Pot Percentage (%)</label><input id="f-pot-pct" type="number" min="0" max="100" step="1" placeholder="100"/></div>
+
+              <div><label>Date</label><input id="f-date" type="date"/></div>
+              <div><label>Time</label><input id="f-time" type="time"/></div>
+              <div><label>End Time (optional)</label><input id="f-end-time" type="time"/></div>
+
+              <div><label>Location</label><select id="f-location-select"></select></div>
+              <div id="f-location-other-wrap" style="display:none"><label>Other Location</label><input id="f-location-other"/></div>
+
+              <div><label>Allow Stripe (card)</label><select id="f-allow-stripe"><option value="yes">Allowed</option><option value="no">Not allowed</option></select></div>
+              <div><label>Zelle Info</label><input id="f-pay-zelle" placeholder="e.g., name / phone / email"/></div>
+              <div><label>CashApp Info</label><input id="f-pay-cashapp" placeholder="$YourCashtag"/></div>
+              <div><label>Onsite Payment</label><select id="f-pay-onsite"><option value="yes">Allowed</option><option value="no">Not allowed</option></select></div>
+
+              <div><label>Status</label><select id="f-status"><option value="open">open</option><option value="hold">hold</option><option value="closed">closed</option></select></div>
+            </div>
+
+            <div class="inline" style="margin-top:10px">
+              <button class="btn primary" type="button" id="btn-save-pot">Save Changes</button>
+              <button class="btn" type="button" id="btn-cancel-edit">Cancel</button>
+            </div>
+          </form>
+        </section>
+      </div>
+    </section>
+
+    <!-- BOTTOM SPONSOR BANNER -->
+    <div id="ad-bottom" class="ad-slot" aria-label="Sponsored" style="display:none"></div>
+    <div id="ad-bottom-meta" class="sponsored-tag" style="display:none">Sponsored</div>
+<div class="tips-bar" id="tipsBar" role="status" aria-live="polite">
+      <strong>Tip:</strong> <span id="tipText">Use the Active Tournaments list to pick your event.</span>
+    </div>
+
+    <div class="foot">© <span id="year"></span> PiCo · <a href="Picklepot_PrivacyPolicy_Comprehensive.pdf" target="_blank" rel="noopener">Privacy Policy</a> · <a href="Picklepot_TermsOfUse_Comprehensive.pdf" target="_blank" rel="noopener">Terms of Use</a> · <a href="PicklePot_Guide.pdf" target="_blank" rel="noopener">PicklePot Guide</a></div>
+  </div>
+
+  <!-- Firebase (compat) -->
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-firestore-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-auth-compat.js"></script>
+
+  <!-- Firebase config -->
+  <script>
+    const firebaseConfig = window.firebaseConfig || {
+      apiKey: "AIzaSyA9QcJizDv1ibAPI7FV_NY8cMhkCjokzXE",
+      authDomain: "pickle-pot.firebaseapp.com",
+      projectId: "pickle-pot",
+      storageBucket: "pickle-pot.appspot.com",
+      messagingSenderId: "508555645160",
+      appId: "1:508555645160:web:82e09803feb83d5150395d"
+    };
+    try {
+      firebase.initializeApp(firebaseConfig);
+      firebase.auth().signInAnonymously().catch(console.error);
+      const missing = !firebaseConfig.apiKey || !firebaseConfig.projectId;
+      if (missing) document.getElementById('configWarning').style.display = '';
+    } catch (e) {
+      document.getElementById('configWarning').style.display = '';
+      console.error("Firebase init error:", e);
+    }
+  </script>
+
+  <!-- App (unchanged working logic) -->
+  <script src="app.js"></script>
+
+  <!-- Tips rotator (simple, does not touch app.js) -->
+  <script>
+    (function(){
+      var tips = [
+        "Use the Active Tournaments list to pick your event, then fill your info to join.",
+        "Members vs Guests have different buy-ins. Verify your selection before joining Pot.",
+        "Choose a payment type. If Stripe is enabled, you’ll be taken to a secure checkout.",
+        "Lower skill can play up; higher skill cannot play down."
+       
+      ];
+      var el = document.getElementById('tipText'); var i = 0;
+      setInterval(function(){ i=(i+1)%tips.length; el.textContent = tips[i]; }, 7000);
+      document.getElementById('year').textContent = new Date().getFullYear();
+    })();
+  </script>
+
+  <!-- Status skinning helper (kept) -->
+  <script>
+    (function(){
+      function applyStatusStyles(){
+        var s = document.getElementById('pi-status');
+        if (s){
+          var txt = (s.textContent||'').toLowerCase();
+          s.classList.remove('open','closed','hold');
+          if (txt.includes('open')) s.classList.add('open');
+          else if (txt.includes('closed')) s.classList.add('closed');
+          else if (txt.includes('hold')) s.classList.add('hold');
+        }
+        var rows = document.querySelectorAll('#adminTable tbody tr');
+        rows.forEach(function(tr){
+          var td = tr.children && tr.children[5];
+          if (!td) return;
+          var t = (td.textContent||'').trim().toLowerCase();
+          td.classList.remove('entry-status','active','inactive','hold');
+          td.classList.add('entry-status');
+          if (t.includes('active')) td.classList.add('active');
+          else if (t.includes('hold')) td.classList.add('hold');
+          else td.classList.add('inactive');
+        });
+      }
+      document.addEventListener('DOMContentLoaded', applyStatusStyles);
+      const obs = new MutationObserver(applyStatusStyles);
+      obs.observe(document.body, { childList:true, subtree:true, characterData:true });
+    })();
+  </script>
+</body>
+</html>
