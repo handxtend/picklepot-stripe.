@@ -1,116 +1,65 @@
-import os, json
-from flask import Flask, request, jsonify, abort
+# app.py
+import os
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 import stripe
 
-# ---------- Stripe ----------
-stripe.api_key = os.environ.get("STRIPE_SECRET_KEY")  # sk_test_... (use test key first)
-WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")  # whsec_...
+# --- Config from environment ---
+stripe.api_key = os.environ["STRIPE_SECRET_KEY"]
+PRICE_ID = os.environ["STRIPE_ORG_PRICE_ID"]
 
-# ---------- Firestore (Admin) ----------
-from google.cloud import firestore
-from google.oauth2 import service_account
-
-project_id = os.environ.get("FIRESTORE_PROJECT_ID")
-
-sa_json = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
-if not sa_json:
-    raise RuntimeError("Missing GOOGLE_APPLICATION_CREDENTIALS_JSON env var")
-creds = service_account.Credentials.from_service_account_info(json.loads(sa_json))
-db = firestore.Client(project=project_id, credentials=creds)
+# Comma-separated origins, no trailing slashes
+ALLOWED_ORIGINS = [
+    o.strip()
+    for o in os.environ.get("CORS_ORIGINS", "").split(",")
+    if o.strip()
+]
 
 app = Flask(__name__)
-# Allow your static site to call us (you can restrict origins later)
-CORS(app, resources={r"/*": {"origins": "*"}})
+CORS(
+    app,
+    origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS else "*",
+    methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type"],
+)
 
 @app.get("/")
 def health():
-    return "ok", 200
+    return "OK", 200
 
-@app.post("/create-checkout-session")
-def create_checkout_session():
-    """
-    Request JSON:
-      {
-        "pot_id": "abc123",
-        "entry_id": "xyz789",
-        "amount_cents": 1000,             # e.g., $10.00
-        "player_name": "Jane Doe",
-        "player_email": "jane@example.com",
-        "success_url": "https://yourapp/success",
-        "cancel_url": "https://yourapp/cancel"
-      }
-    """
-    data = request.get_json(force=True, silent=True) or {}
-    required = ["pot_id","entry_id","amount_cents","success_url","cancel_url"]
-    missing = [k for k in required if k not in data]
-    if missing:
-        return jsonify({"error": f"Missing: {', '.join(missing)}"}), 400
+# Helper to honor preflight quickly
+def _maybe_preflight():
+    if request.method == "OPTIONS":
+        # Flask-CORS will add ACA* headers; 204 means “preflight OK”
+        return ("", 204)
 
-    amount = int(data["amount_cents"])
-    if amount < 50:
-        return jsonify({"error":"Minimum is 50¢"}), 400
+# --- Primary route used by the frontend ---
+@app.route("/create-organizer-subscription", methods=["POST", "OPTIONS"])
+def create_organizer_subscription():
+    pf = _maybe_preflight()
+    if pf:
+        return pf
+
+    data = request.get_json(silent=True) or {}
+    # default return url to same origin if not provided
+    return_url = data.get("returnUrl") or "https://pickle-pot.web.app?sub=success"
 
     try:
         session = stripe.checkout.Session.create(
-            mode="payment",
-            payment_method_types=["card","link"],   # Apple/Google Pay supported automatically
-            line_items=[{
-                "price_data": {
-                    "currency": "usd",
-                    "product_data": {
-                        "name": f"Pickle Pot Entry ({data.get('player_name','Player')})",
-                        "metadata": {
-                            "pot_id": data["pot_id"],
-                            "entry_id": data["entry_id"]
-                        }
-                    },
-                    "unit_amount": amount
-                },
-                "quantity": 1
-            }],
-            customer_email=data.get("player_email"),
-            success_url=data["success_url"] + "?session_id={CHECKOUT_SESSION_ID}",
-            cancel_url=data["cancel_url"],
-            client_reference_id=f"{data['pot_id']}::{data['entry_id']}",
-            metadata={ "pot_id": data["pot_id"], "entry_id": data["entry_id"] }
+            mode="subscription",
+            line_items=[{"price": PRICE_ID, "quantity": 1}],
+            success_url=return_url,
+            cancel_url=return_url.replace("success", "cancel"),
         )
-        return jsonify({"url": session.url})
+        return jsonify({"url": session.url}), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 400
+        app.logger.exception("Stripe session error")
+        return jsonify({"error": str(e)}), 500
 
-@app.post("/webhook")
-def webhook():
-    payload = request.data
-    sig_header = request.headers.get("Stripe-Signature", "")
-    try:
-        event = stripe.Webhook.construct_event(payload, sig_header, WEBHOOK_SECRET)
-    except Exception as e:
-        return abort(400, str(e))
-
-    etype = event.get("type", "")
-    # Check both sync and async success
-    if etype in ("checkout.session.completed", "checkout.session.async_payment_succeeded"):
-        session = event["data"]["object"]
-        meta = session.get("metadata") or {}
-        pot_id = meta.get("pot_id")
-        entry_id = meta.get("entry_id")
-        amount_total = session.get("amount_total")
-
-        if pot_id and entry_id:
-            try:
-                db.collection("pots").document(pot_id)\
-                  .collection("entries").document(entry_id)\
-                  .set({
-                      "paid": True,
-                      "paid_amount": amount_total,
-                      "paid_at": firestore.SERVER_TIMESTAMP
-                  }, merge=True)
-            except Exception as e:
-                # Log to server output; Stripe will retry on 5xx only, so we return 200 here.
-                print("Firestore update failed:", e)
-
-    return "ok", 200
+# --- Back-compat alias (if the frontend ever calls the older name) ---
+@app.route("/create-checkout-session", methods=["POST", "OPTIONS"])
+def create_checkout_session_alias():
+    return create_organizer_subscription()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
