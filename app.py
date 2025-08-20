@@ -11,14 +11,20 @@ from firebase_admin import credentials, firestore
 
 # ---------- Config from environment ----------
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
-STRIPE_PRICE_ID   = os.environ.get("STRIPE_PRICE_ID", "")  # e.g. price_123 for the Organizer monthly plan
+# accept either STRIPE_PRICE_ID or STRIPE_ORG_PRICE_ID
+STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID") or os.environ.get("STRIPE_ORG_PRICE_ID", "")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 
-# Service account JSON for Firebase Admin SDK (store the full JSON in this env var)
-FIREBASE_SERVICE_ACCOUNT_JSON = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "")
+# Accept either JSON string or file path under common env names
+FIREBASE_SERVICE_ACCOUNT_JSON = (
+    os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
+    or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+    or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    or ""
+)
 
 # Optional CORS allowlist (comma-separated origins). If blank, allow all.
-CORS_ALLOW = os.environ.get("CORS_ALLOW", "*")
+CORS_ALLOW = os.environ.get("CORS_ALLOW") or os.environ.get("CORS_ORIGINS") or "*"
 
 stripe.api_key = STRIPE_SECRET_KEY
 
@@ -27,8 +33,21 @@ app = Flask(__name__)
 if CORS_ALLOW == "*" or not CORS_ALLOW:
     CORS(app)
 else:
-    CORS(app, origins=[o.strip() for o in CORS_ALLOW.split(",")])
-# put this at top-level (NOT inside any function), anywhere after: app = Flask(__name__)
+    origins = [o.strip() for o in CORS_ALLOW.split(",") if o.strip()]
+    CORS(
+        app,
+        resources={r"/*": {"origins": origins}},
+        supports_credentials=False,
+        allow_headers=["Content-Type", "Authorization"],
+        methods=["GET", "POST", "OPTIONS"],
+    )
+
+@app.after_request
+def add_cors_headers(resp):
+    # Ensure these are always present (helps some proxies)
+    resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization")
+    resp.headers.setdefault("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+    return resp
 
 # ---------- Initialize Firestore ----------
 if not firebase_admin._apps:
@@ -37,7 +56,9 @@ if not firebase_admin._apps:
     elif os.path.isfile(FIREBASE_SERVICE_ACCOUNT_JSON):
         cred = credentials.Certificate(FIREBASE_SERVICE_ACCOUNT_JSON)
     else:
-        raise RuntimeError("FIREBASE_SERVICE_ACCOUNT_JSON is not set to a JSON string or filepath")
+        raise RuntimeError(
+            "Set FIREBASE_SERVICE_ACCOUNT_JSON to the JSON string or file path for your service account."
+        )
     firebase_admin.initialize_app(cred)
 db = firestore.client()
 
@@ -76,8 +97,12 @@ def write_subscription_status(uid: str, customer_id: str, subscription_obj: dict
     doc_ref.set(payload, merge=True)
 
 # ---------- Routes ----------
-@app.get("/")
+@app.route("/healthz", methods=["GET"])
 def healthz():
+    return "ok", 200
+
+@app.get("/")
+def root():
     return "ok", 200
 
 @app.route("/create-organizer-subscription", methods=["POST"])
@@ -108,7 +133,7 @@ def create_subscription():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.("/stripe-webhook", methods=["POST"])
+@app.route("/stripe-webhook", methods=["POST"])
 def stripe_webhook():
     """Handle Stripe webhook events to activate/deactivate organizer subscription."""
     payload = request.data
@@ -126,11 +151,9 @@ def stripe_webhook():
 
     try:
         if event_type == "checkout.session.completed":
-            # Session completed for a subscription
             uid = data_obj.get("client_reference_id") or (data_obj.get("metadata") or {}).get("uid")
             subscription_id = data_obj.get("subscription")
             customer_id = data_obj.get("customer")
-
             if uid and subscription_id:
                 sub = stripe.Subscription.retrieve(subscription_id)
                 write_subscription_status(uid, customer_id, sub)
@@ -154,7 +177,7 @@ def stripe_webhook():
                 write_subscription_status(uid, customer_id, sub)
 
     except Exception as e:
-        # Log and acknowledge to prevent retries
+        # Log and acknowledge to prevent Stripe retries
         print("Webhook handling error:", e)
         return "ok", 200
 
@@ -163,5 +186,3 @@ def stripe_webhook():
 if __name__ == "__main__":
     # For local testing
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-
-
