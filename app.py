@@ -75,7 +75,7 @@ def write_subscription_status(uid: str, customer_id: str, subscription_obj: dict
     doc_ref.set(payload, merge=True)
 
 # ---------- Routes ----------
-@app.route("/healthz")
+@app.get("/healthz")
 def healthz():
     return "ok", 200
 
@@ -162,3 +162,4 @@ def stripe_webhook():
 if __name__ == "__main__":
     # For local testing
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
