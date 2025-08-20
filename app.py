@@ -28,6 +28,11 @@ if CORS_ALLOW == "*" or not CORS_ALLOW:
     CORS(app)
 else:
     CORS(app, origins=[o.strip() for o in CORS_ALLOW.split(",")])
+# put this at top-level (NOT inside any function), anywhere after: app = Flask(__name__)
+
+@app.route("/healthz", methods=["GET"])
+def healthz():
+    return "ok", 200
 
 # ---------- Initialize Firestore ----------
 if not firebase_admin._apps:
@@ -75,7 +80,7 @@ def write_subscription_status(uid: str, customer_id: str, subscription_obj: dict
     doc_ref.set(payload, merge=True)
 
 # ---------- Routes ----------
-@app.get("/healthz")
+@app.get("/")
 def healthz():
     return "ok", 200
 
