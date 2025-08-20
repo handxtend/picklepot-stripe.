@@ -30,10 +30,6 @@ else:
     CORS(app, origins=[o.strip() for o in CORS_ALLOW.split(",")])
 # put this at top-level (NOT inside any function), anywhere after: app = Flask(__name__)
 
-@app.route("/healthz", methods=["GET"])
-def healthz():
-    return "ok", 200
-
 # ---------- Initialize Firestore ----------
 if not firebase_admin._apps:
     if FIREBASE_SERVICE_ACCOUNT_JSON.strip().startswith("{"):
@@ -112,7 +108,7 @@ def create_subscription():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route("/stripe-webhook", methods=["POST"])
+@app.("/stripe-webhook", methods=["POST"])
 def stripe_webhook():
     """Handle Stripe webhook events to activate/deactivate organizer subscription."""
     payload = request.data
@@ -167,4 +163,5 @@ def stripe_webhook():
 if __name__ == "__main__":
     # For local testing
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
 
