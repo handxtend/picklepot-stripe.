@@ -1,5 +1,5 @@
-flask
-gunicorn
+Flask
 flask-cors
 stripe
 firebase-admin
+sendgrid
