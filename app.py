@@ -20,6 +20,19 @@ STRIPE_PRICE_ID_MONTHLY = (
 STRIPE_PRICE_ID_YEARLY = os.environ.get("STRIPE_PRICE_ID_YEARLY", "")
 
 # --- Stripe prices for organizers (Phase A) ---
+
+IND_M = os.environ.get('STRIPE_PRICE_ID_INDIVIDUAL_MONTHLY', 'price_1Rwq6nFFPAbZxH9HkmDxBJ73')
+IND_Y = os.environ.get('STRIPE_PRICE_ID_INDIVIDUAL_YEARLY',  'price_1RwptxFFPAbZxH9HdPLdYIZR')
+CLB_M = os.environ.get('STRIPE_PRICE_ID_CLUB_MONTHLY',       'price_1Rwq1JFFPAbZxH9HmpYCSJYv')
+CLB_Y = os.environ.get('STRIPE_PRICE_ID_CLUB_YEARLY',        'price_1RwpyUFFPAbZxH9H2N1Ykd4U')
+
+PLAN_CONFIG = {
+    IND_M: {'plan': 'individual', 'pots_per_month': 2,  'max_users_per_event': 12},
+    IND_Y: {'plan': 'individual', 'pots_per_month': 2,  'max_users_per_event': 12},
+    CLB_M: {'plan': 'club',       'pots_per_month': 10, 'max_users_per_event': 64},
+    CLB_Y: {'plan': 'club',       'pots_per_month': 10, 'max_users_per_event': 64},
+}
+ALLOWED_PRICE_IDS = list(PLAN_CONFIG.keys())
 # Defaults provided; can be overridden by environment on Render.
 STRIPE_PRICE_ID_INDIVIDUAL = os.environ.get("STRIPE_PRICE_ID_INDIVIDUAL", "price_1Rwq6nFFPAbZxH9HkmDxBJ73")
 STRIPE_PRICE_ID_CLUB       = os.environ.get("STRIPE_PRICE_ID_CLUB",       "price_1Rwq1JFFPAbZxH9HmpYCSJYv")
