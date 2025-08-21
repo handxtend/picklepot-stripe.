@@ -4,6 +4,15 @@ import json
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import stripe
+import os
+from datetime import datetime
+try:
+    from sendgrid import SendGridAPIClient
+    from sendgrid.helpers.mail import Mail
+except Exception:
+    SendGridAPIClient = None
+    Mail = None
+
 
 # --- Firestore (Firebase Admin) ---
 import firebase_admin
@@ -20,24 +29,15 @@ STRIPE_PRICE_ID_MONTHLY = (
 STRIPE_PRICE_ID_YEARLY = os.environ.get("STRIPE_PRICE_ID_YEARLY", "")
 
 # --- Stripe prices for organizers (Phase A) ---
-
-IND_M = os.environ.get('STRIPE_PRICE_ID_INDIVIDUAL_MONTHLY', 'price_1Rwq6nFFPAbZxH9HkmDxBJ73')
-IND_Y = os.environ.get('STRIPE_PRICE_ID_INDIVIDUAL_YEARLY',  'price_1RwptxFFPAbZxH9HdPLdYIZR')
-CLB_M = os.environ.get('STRIPE_PRICE_ID_CLUB_MONTHLY',       'price_1Rwq1JFFPAbZxH9HmpYCSJYv')
-CLB_Y = os.environ.get('STRIPE_PRICE_ID_CLUB_YEARLY',        'price_1RwpyUFFPAbZxH9H2N1Ykd4U')
-
-PLAN_CONFIG = {
-    IND_M: {'plan': 'individual', 'pots_per_month': 2,  'max_users_per_event': 12},
-    IND_Y: {'plan': 'individual', 'pots_per_month': 2,  'max_users_per_event': 12},
-    CLB_M: {'plan': 'club',       'pots_per_month': 10, 'max_users_per_event': 64},
-    CLB_Y: {'plan': 'club',       'pots_per_month': 10, 'max_users_per_event': 64},
-}
-ALLOWED_PRICE_IDS = list(PLAN_CONFIG.keys())
 # Defaults provided; can be overridden by environment on Render.
 STRIPE_PRICE_ID_INDIVIDUAL = os.environ.get("STRIPE_PRICE_ID_INDIVIDUAL", "price_1Rwq6nFFPAbZxH9HkmDxBJ73")
 STRIPE_PRICE_ID_CLUB       = os.environ.get("STRIPE_PRICE_ID_CLUB",       "price_1Rwq1JFFPAbZxH9HmpYCSJYv")
 
-# (removed duplicate 2-price PLAN_CONFIG)
+# Map price_id -> plan metadata/limits
+PLAN_CONFIG = {
+    STRIPE_PRICE_ID_INDIVIDUAL: {"plan": "individual", "pots_per_month": 2,  "max_users_per_event": 12},
+    STRIPE_PRICE_ID_CLUB:       {"plan": "club",       "pots_per_month": 10, "max_users_per_event": 64},
+}
 
 # Webhook secret
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
@@ -54,11 +54,8 @@ FIREBASE_SERVICE_ACCOUNT_JSON = (
 CORS_ALLOW = os.environ.get("CORS_ALLOW") or os.environ.get("CORS_ORIGINS") or "*"
 
 # Whitelist allowed Stripe Prices (prevents tampering from the client)
-_FOUR_PRICES = [IND_M, IND_Y, CLB_M, CLB_Y]
-_LEGACY = [STRIPE_PRICE_ID_MONTHLY, STRIPE_PRICE_ID_YEARLY, STRIPE_PRICE_ID_INDIVIDUAL if 'STRIPE_PRICE_ID_INDIVIDUAL' in globals() else '', STRIPE_PRICE_ID_CLUB if 'STRIPE_PRICE_ID_CLUB' in globals() else '']
-_ALLOWED_SET = set([p for p in (_FOUR_PRICES + _LEGACY) if p])
+_ALLOWED_SET = set([pid for pid in PLAN_CONFIG.keys() if pid] + [STRIPE_PRICE_ID_MONTHLY, STRIPE_PRICE_ID_YEARLY])
 ALLOWED_PRICE_IDS = [p for p in _ALLOWED_SET if p]
-print('[startup] Allowed price IDs at startup:', ALLOWED_PRICE_IDS)
 
 stripe.api_key = STRIPE_SECRET_KEY
 
@@ -263,3 +260,96 @@ def stripe_webhook():
 if __name__ == "__main__":
     # For local testing
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
+
+FROM_EMAIL = os.environ.get('FROM_EMAIL', 'no-reply@pickleballcompete.com')
+FROM_NAME  = os.environ.get('FROM_NAME',  'PicklePot')
+
+def _send_email(to_email: str, subject: str, html: str):
+    api_key = os.environ.get('SENDGRID_API_KEY', '')
+    if not api_key or not SendGridAPIClient or not Mail:
+        print('[email] SENDGRID_API_KEY missing or library unavailable; email not sent. Subject:', subject, 'To:', to_email)
+        return False
+    try:
+        message = Mail(from_email=(FROM_EMAIL, FROM_NAME), to_emails=to_email, subject=subject, html_content=html)
+        sg = SendGridAPIClient(api_key)
+        resp = sg.send(message)
+        print('[email] sent:', resp.status_code)
+        return True
+    except Exception as e:
+        print('[email] error:', e)
+        return False
+
+def _generate_temp_password():
+    import secrets, string
+    alphabet = string.ascii_letters + string.digits
+    return ''.join(secrets.choice(alphabet) for _ in range(12))
+
+
+def ensure_user_for_email(email: str):
+    # Returns (uid, password_used_or_None, created: bool)
+    pw = _generate_temp_password()
+    try:
+        u = auth.get_user_by_email(email)
+        # Set (or reset) password
+        auth.update_user(u.uid, password=pw)
+        created = False
+        uid = u.uid
+    except auth.UserNotFoundError:
+        u = auth.create_user(email=email, password=pw, email_verified=True)
+        uid = u.uid
+        created = True
+    # Email the password
+    _send_email(email, 'Your PicklePot Organizer Account', f'''
+        <p>Hi,</p>
+        <p>Your organizer account is ready. Sign in using your email and this temporary password:</p>
+        <p><b>{pw}</b></p>
+        <p>Please sign in at <a href="https://picklepotters.netlify.app/#signin">picklepotters.netlify.app</a> and change your password.</p>
+        <p>— PicklePot</p>
+    ''')
+    return uid, pw, created
+
+
+def handle_checkout_completed(session):
+    # session: stripe.Event.data.object for checkout.session.completed
+    email = None
+    try:
+        email = (session.get('customer_details') or {}).get('email') or session.get('customer_email')
+    except Exception:
+        pass
+    if not email:
+        print('[webhook] no email on session; cannot create user')
+        return
+
+    # Retrieve subscription to get price_id and period end
+    sub_id = session.get('subscription')
+    price_id = None
+    current_period_end = None
+    if sub_id:
+        try:
+            sub = stripe.Subscription.retrieve(sub_id)
+            items = sub.get('items', {}).get('data', [])
+            if items:
+                price_id = items[0]['price']['id']
+            current_period_end = sub.get('current_period_end')
+        except Exception as e:
+            print('[webhook] sub retrieve error:', e)
+
+    uid, pw, created = ensure_user_for_email(email)
+
+    # Write organizer_subs by uid
+    plan_info = PLAN_CONFIG.get(price_id) or {'plan': 'unknown'}
+    doc = {
+        'email': email,
+        'uid': uid,
+        'price_id': price_id,
+        'plan': plan_info.get('plan', 'unknown'),
+        'pots_per_month': plan_info.get('pots_per_month'),
+        'max_users_per_event': plan_info.get('max_users_per_event'),
+        'status': 'active',
+        'source': 'stripe',
+        'current_period_end': current_period_end,
+        'updated_at': datetime.utcnow().isoformat() + 'Z'
+    }
+    db.collection('organizer_subs').document(uid).set(doc, merge=True)
+    print('[webhook] organizer_subs updated for', email, 'uid=', uid, 'price=', price_id)
