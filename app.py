@@ -37,11 +37,7 @@ ALLOWED_PRICE_IDS = list(PLAN_CONFIG.keys())
 STRIPE_PRICE_ID_INDIVIDUAL = os.environ.get("STRIPE_PRICE_ID_INDIVIDUAL", "price_1Rwq6nFFPAbZxH9HkmDxBJ73")
 STRIPE_PRICE_ID_CLUB       = os.environ.get("STRIPE_PRICE_ID_CLUB",       "price_1Rwq1JFFPAbZxH9HmpYCSJYv")
 
-# Map price_id -> plan metadata/limits
-PLAN_CONFIG = {
-    STRIPE_PRICE_ID_INDIVIDUAL: {"plan": "individual", "pots_per_month": 2,  "max_users_per_event": 12},
-    STRIPE_PRICE_ID_CLUB:       {"plan": "club",       "pots_per_month": 10, "max_users_per_event": 64},
-}
+# (removed duplicate 2-price PLAN_CONFIG)
 
 # Webhook secret
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
@@ -58,8 +54,11 @@ FIREBASE_SERVICE_ACCOUNT_JSON = (
 CORS_ALLOW = os.environ.get("CORS_ALLOW") or os.environ.get("CORS_ORIGINS") or "*"
 
 # Whitelist allowed Stripe Prices (prevents tampering from the client)
-_ALLOWED_SET = set([pid for pid in PLAN_CONFIG.keys() if pid] + [STRIPE_PRICE_ID_MONTHLY, STRIPE_PRICE_ID_YEARLY])
+_FOUR_PRICES = [IND_M, IND_Y, CLB_M, CLB_Y]
+_LEGACY = [STRIPE_PRICE_ID_MONTHLY, STRIPE_PRICE_ID_YEARLY, STRIPE_PRICE_ID_INDIVIDUAL if 'STRIPE_PRICE_ID_INDIVIDUAL' in globals() else '', STRIPE_PRICE_ID_CLUB if 'STRIPE_PRICE_ID_CLUB' in globals() else '']
+_ALLOWED_SET = set([p for p in (_FOUR_PRICES + _LEGACY) if p])
 ALLOWED_PRICE_IDS = [p for p in _ALLOWED_SET if p]
+print('[startup] Allowed price IDs at startup:', ALLOWED_PRICE_IDS)
 
 stripe.api_key = STRIPE_SECRET_KEY
 
