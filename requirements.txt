@@ -2,4 +2,4 @@ Flask
 flask-cors
 stripe
 firebase-admin
-sendgrid
+# sendgrid  # not needed yet; uncomment when you start emailing
