@@ -1,11 +1,16 @@
 # app.py - Flask backend for Organizer Subscription (Stripe + Firestore)
-import os
-import json
+import os, json
+from datetime import datetime
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import stripe
-import os
-from datetime import datetime
+
+# --- Firestore (Firebase Admin) ---
+import firebase_admin
+from firebase_admin import credentials, firestore, auth  # import auth for optional helpers
+
+# --- Optional email (SendGrid). Safe if not installed. ---
 try:
     from sendgrid import SendGridAPIClient
     from sendgrid.helpers.mail import Mail
@@ -13,30 +18,29 @@ except Exception:
     SendGridAPIClient = None
     Mail = None
 
-
-# --- Firestore (Firebase Admin) ---
-import firebase_admin
-from firebase_admin import credentials, firestore
-
 # ---------- Config from environment ----------
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
 
-# Legacy monthly/yearly (kept for backward-compat)
+# Legacy monthly/yearly (kept for backward-compat with older frontends)
 STRIPE_PRICE_ID_MONTHLY = (
     os.environ.get("STRIPE_PRICE_ID")
     or os.environ.get("STRIPE_ORG_PRICE_ID", "")
 )
 STRIPE_PRICE_ID_YEARLY = os.environ.get("STRIPE_PRICE_ID_YEARLY", "")
 
-# --- Stripe prices for organizers (Phase A) ---
-# Defaults provided; can be overridden by environment on Render.
-STRIPE_PRICE_ID_INDIVIDUAL = os.environ.get("STRIPE_PRICE_ID_INDIVIDUAL", "price_1Rwq6nFFPAbZxH9HkmDxBJ73")
-STRIPE_PRICE_ID_CLUB       = os.environ.get("STRIPE_PRICE_ID_CLUB",       "price_1Rwq1JFFPAbZxH9HmpYCSJYv")
+# --- Four live prices (Individual/Club × Monthly/Yearly) ---
+# Defaults are your live IDs; you can override via Render ENV.
+IND_M = os.environ.get("STRIPE_PRICE_ID_INDIVIDUAL_MONTHLY", "price_1Rwq6nFFPAbZxH9HkmDxBJ73")
+IND_Y = os.environ.get("STRIPE_PRICE_ID_INDIVIDUAL_YEARLY",  "price_1RwptxFFPAbZxH9HdPLdYIZR")
+CLB_M = os.environ.get("STRIPE_PRICE_ID_CLUB_MONTHLY",       "price_1Rwq1JFFPAbZxH9HmpYCSJYv")
+CLB_Y = os.environ.get("STRIPE_PRICE_ID_CLUB_YEARLY",        "price_1RwpyUFFPAbZxH9H2N1Ykd4U")
 
 # Map price_id -> plan metadata/limits
 PLAN_CONFIG = {
-    STRIPE_PRICE_ID_INDIVIDUAL: {"plan": "individual", "pots_per_month": 2,  "max_users_per_event": 12},
-    STRIPE_PRICE_ID_CLUB:       {"plan": "club",       "pots_per_month": 10, "max_users_per_event": 64},
+    IND_M: {"plan": "individual", "pots_per_month": 2,  "max_users_per_event": 12},
+    IND_Y: {"plan": "individual", "pots_per_month": 2,  "max_users_per_event": 12},
+    CLB_M: {"plan": "club",       "pots_per_month": 10, "max_users_per_event": 64},
+    CLB_Y: {"plan": "club",       "pots_per_month": 10, "max_users_per_event": 64},
 }
 
 # Webhook secret
@@ -54,7 +58,9 @@ FIREBASE_SERVICE_ACCOUNT_JSON = (
 CORS_ALLOW = os.environ.get("CORS_ALLOW") or os.environ.get("CORS_ORIGINS") or "*"
 
 # Whitelist allowed Stripe Prices (prevents tampering from the client)
-_ALLOWED_SET = set([pid for pid in PLAN_CONFIG.keys() if pid] + [STRIPE_PRICE_ID_MONTHLY, STRIPE_PRICE_ID_YEARLY])
+_FOUR = [IND_M, IND_Y, CLB_M, CLB_Y]
+_LEGACY = [STRIPE_PRICE_ID_MONTHLY, STRIPE_PRICE_ID_YEARLY]
+_ALLOWED_SET = set([p for p in (_FOUR + _LEGACY) if p])
 ALLOWED_PRICE_IDS = [p for p in _ALLOWED_SET if p]
 
 stripe.api_key = STRIPE_SECRET_KEY
@@ -82,7 +88,7 @@ def add_cors_headers(resp):
 
 # ---------- Initialize Firestore ----------
 if not firebase_admin._apps:
-    if FIREBASE_SERVICE_ACCOUNT_JSON.strip().startswith("{"):
+    if FIREBASE_SERVICE_ACCOUNT_JSON.strip().startswith('{'):
         cred = credentials.Certificate(json.loads(FIREBASE_SERVICE_ACCOUNT_JSON))
     elif os.path.isfile(FIREBASE_SERVICE_ACCOUNT_JSON):
         cred = credentials.Certificate(FIREBASE_SERVICE_ACCOUNT_JSON)
@@ -137,7 +143,7 @@ def _plan_bits_from_price_id(price_id: str):
 def write_subscription_status(uid: str, customer_id: str, subscription_obj: dict):
     """
     Write subscription fields to Firestore: organizer_subs/{uid}
-    Includes plan (price_id), interval, amount, currency, status, period end, and Phase A limits.
+    Includes plan (price_id), interval, amount, currency, status, period end, and limits.
     """
     status = subscription_obj.get("status")
     current_period_end = subscription_obj.get("current_period_end")  # unix ts (sec)
@@ -154,10 +160,10 @@ def write_subscription_status(uid: str, customer_id: str, subscription_obj: dict
         "stripe_subscription_id": subscription_obj.get("id"),
         # Plan details
         "price_id": price_id,
-        "interval": interval,                # "month" | "year" (if configured in Stripe)
+        "interval": interval,                # "month" | "year"
         "amount_cents": amount_cents,
         "currency": currency,
-        # Phase A: limits
+        # Limits
         **plan_bits,
         "updated_at": firestore.SERVER_TIMESTAMP,
     }
@@ -180,8 +186,8 @@ def create_subscription():
     success_url = data.get("success_url")
     cancel_url = data.get("cancel_url")
 
-    # Accept explicit price_id (from UI plan selector). Fall back: individual -> monthly legacy.
-    price_id = (data.get("price_id") or STRIPE_PRICE_ID_INDIVIDUAL or STRIPE_PRICE_ID_MONTHLY or "").strip()
+    # Require explicit price_id from the UI plan selector.
+    price_id = (data.get("price_id") or "").strip()
 
     if not (uid and success_url and cancel_url and price_id):
         return jsonify({"error": "Missing uid/success_url/cancel_url or price_id"}), 400
@@ -262,6 +268,7 @@ if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
 
 
+# ---------------- Optional email helpers (not required) ---------------- #
 FROM_EMAIL = os.environ.get('FROM_EMAIL', 'no-reply@pickleballcompete.com')
 FROM_NAME  = os.environ.get('FROM_NAME',  'PicklePot')
 
@@ -285,7 +292,6 @@ def _generate_temp_password():
     alphabet = string.ascii_letters + string.digits
     return ''.join(secrets.choice(alphabet) for _ in range(12))
 
-
 def ensure_user_for_email(email: str):
     # Returns (uid, password_used_or_None, created: bool)
     pw = _generate_temp_password()
@@ -308,48 +314,3 @@ def ensure_user_for_email(email: str):
         <p>— PicklePot</p>
     ''')
     return uid, pw, created
-
-
-def handle_checkout_completed(session):
-    # session: stripe.Event.data.object for checkout.session.completed
-    email = None
-    try:
-        email = (session.get('customer_details') or {}).get('email') or session.get('customer_email')
-    except Exception:
-        pass
-    if not email:
-        print('[webhook] no email on session; cannot create user')
-        return
-
-    # Retrieve subscription to get price_id and period end
-    sub_id = session.get('subscription')
-    price_id = None
-    current_period_end = None
-    if sub_id:
-        try:
-            sub = stripe.Subscription.retrieve(sub_id)
-            items = sub.get('items', {}).get('data', [])
-            if items:
-                price_id = items[0]['price']['id']
-            current_period_end = sub.get('current_period_end')
-        except Exception as e:
-            print('[webhook] sub retrieve error:', e)
-
-    uid, pw, created = ensure_user_for_email(email)
-
-    # Write organizer_subs by uid
-    plan_info = PLAN_CONFIG.get(price_id) or {'plan': 'unknown'}
-    doc = {
-        'email': email,
-        'uid': uid,
-        'price_id': price_id,
-        'plan': plan_info.get('plan', 'unknown'),
-        'pots_per_month': plan_info.get('pots_per_month'),
-        'max_users_per_event': plan_info.get('max_users_per_event'),
-        'status': 'active',
-        'source': 'stripe',
-        'current_period_end': current_period_end,
-        'updated_at': datetime.utcnow().isoformat() + 'Z'
-    }
-    db.collection('organizer_subs').document(uid).set(doc, merge=True)
-    print('[webhook] organizer_subs updated for', email, 'uid=', uid, 'price=', price_id)
