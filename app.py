@@ -12,14 +12,25 @@ from firebase_admin import credentials, firestore
 # ---------- Config from environment ----------
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
 
-# Monthly (keep backwards-compat with STRIPE_ORG_PRICE_ID)
+# Legacy monthly/yearly (kept for backward-compat)
 STRIPE_PRICE_ID_MONTHLY = (
     os.environ.get("STRIPE_PRICE_ID")
     or os.environ.get("STRIPE_ORG_PRICE_ID", "")
 )
-# Yearly
 STRIPE_PRICE_ID_YEARLY = os.environ.get("STRIPE_PRICE_ID_YEARLY", "")
 
+# --- Stripe prices for organizers (Phase A) ---
+# Defaults provided; can be overridden by environment on Render.
+STRIPE_PRICE_ID_INDIVIDUAL = os.environ.get("STRIPE_PRICE_ID_INDIVIDUAL", "price_1Rwq6nFFPAbZxH9HkmDxBJ73")
+STRIPE_PRICE_ID_CLUB       = os.environ.get("STRIPE_PRICE_ID_CLUB",       "price_1Rwq1JFFPAbZxH9HmpYCSJYv")
+
+# Map price_id -> plan metadata/limits
+PLAN_CONFIG = {
+    STRIPE_PRICE_ID_INDIVIDUAL: {"plan": "individual", "pots_per_month": 2,  "max_users_per_event": 12},
+    STRIPE_PRICE_ID_CLUB:       {"plan": "club",       "pots_per_month": 10, "max_users_per_event": 64},
+}
+
+# Webhook secret
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 
 # Accept JSON string or file path under common env names
@@ -34,9 +45,8 @@ FIREBASE_SERVICE_ACCOUNT_JSON = (
 CORS_ALLOW = os.environ.get("CORS_ALLOW") or os.environ.get("CORS_ORIGINS") or "*"
 
 # Whitelist allowed Stripe Prices (prevents tampering from the client)
-ALLOWED_PRICE_IDS = [
-    p for p in [STRIPE_PRICE_ID_MONTHLY, STRIPE_PRICE_ID_YEARLY] if p
-]
+_ALLOWED_SET = set([pid for pid in PLAN_CONFIG.keys() if pid] + [STRIPE_PRICE_ID_MONTHLY, STRIPE_PRICE_ID_YEARLY])
+ALLOWED_PRICE_IDS = [p for p in _ALLOWED_SET if p]
 
 stripe.api_key = STRIPE_SECRET_KEY
 
@@ -93,21 +103,39 @@ def get_or_create_customer_for_uid(uid: str):
     doc_ref.set({"customer_id": customer["id"]}, merge=True)
     return customer["id"]
 
-def write_subscription_status(uid: str, customer_id: str, subscription_obj: dict):
-    """
-    Write subscription fields to Firestore: organizer_subs/{uid}
-    Includes plan (price_id, interval), amount, currency, status, and period end.
-    """
-    status = subscription_obj.get("status")
-
-    current_period_end = subscription_obj.get("current_period_end")  # unix ts (sec)
-    current_period_end_ms = int(current_period_end) * 1000 if current_period_end else None
-
-    # Extract plan/price info from first item
+def _extract_price_info_from_subscription(subscription_obj: dict):
+    """Return (price_id, interval, amount_cents, currency)."""
     items = (subscription_obj.get("items", {}) or {}).get("data") or []
     first = items[0] if items else {}
     price = (first or {}).get("price") or {}
     recurring = price.get("recurring") or {}
+    return (
+        price.get("id"),
+        recurring.get("interval"),
+        price.get("unit_amount"),
+        price.get("currency"),
+    )
+
+def _plan_bits_from_price_id(price_id: str):
+    """Look up plan metadata (plan name + limits) from a price_id."""
+    info = PLAN_CONFIG.get(price_id) or {}
+    return {
+        "plan": info.get("plan"),
+        "pots_per_month": info.get("pots_per_month"),
+        "max_users_per_event": info.get("max_users_per_event"),
+    }
+
+def write_subscription_status(uid: str, customer_id: str, subscription_obj: dict):
+    """
+    Write subscription fields to Firestore: organizer_subs/{uid}
+    Includes plan (price_id), interval, amount, currency, status, period end, and Phase A limits.
+    """
+    status = subscription_obj.get("status")
+    current_period_end = subscription_obj.get("current_period_end")  # unix ts (sec)
+    current_period_end_ms = int(current_period_end) * 1000 if current_period_end else None
+
+    price_id, interval, amount_cents, currency = _extract_price_info_from_subscription(subscription_obj)
+    plan_bits = _plan_bits_from_price_id(price_id or "")
 
     doc_ref = db.collection("organizer_subs").document(uid)
     payload = {
@@ -116,10 +144,12 @@ def write_subscription_status(uid: str, customer_id: str, subscription_obj: dict
         "stripe_customer_id": customer_id,
         "stripe_subscription_id": subscription_obj.get("id"),
         # Plan details
-        "price_id": price.get("id"),
-        "interval": recurring.get("interval"),      # "month" | "year"
-        "amount_cents": price.get("unit_amount"),
-        "currency": price.get("currency"),
+        "price_id": price_id,
+        "interval": interval,                # "month" | "year" (if configured in Stripe)
+        "amount_cents": amount_cents,
+        "currency": currency,
+        # Phase A: limits
+        **plan_bits,
         "updated_at": firestore.SERVER_TIMESTAMP,
     }
     doc_ref.set(payload, merge=True)
@@ -141,8 +171,8 @@ def create_subscription():
     success_url = data.get("success_url")
     cancel_url = data.get("cancel_url")
 
-    # NEW: accept price_id from client, default to monthly
-    price_id = data.get("price_id") or STRIPE_PRICE_ID_MONTHLY
+    # Accept explicit price_id (from UI plan selector). Fall back: individual -> monthly legacy.
+    price_id = (data.get("price_id") or STRIPE_PRICE_ID_INDIVIDUAL or STRIPE_PRICE_ID_MONTHLY or "").strip()
 
     if not (uid and success_url and cancel_url and price_id):
         return jsonify({"error": "Missing uid/success_url/cancel_url or price_id"}), 400
