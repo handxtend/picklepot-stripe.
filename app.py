@@ -11,11 +11,18 @@ from firebase_admin import credentials, firestore
 
 # ---------- Config from environment ----------
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
-# accept either STRIPE_PRICE_ID or STRIPE_ORG_PRICE_ID
-STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID") or os.environ.get("STRIPE_ORG_PRICE_ID", "")
+
+# Monthly (keep backwards-compat with STRIPE_ORG_PRICE_ID)
+STRIPE_PRICE_ID_MONTHLY = (
+    os.environ.get("STRIPE_PRICE_ID")
+    or os.environ.get("STRIPE_ORG_PRICE_ID", "")
+)
+# Yearly
+STRIPE_PRICE_ID_YEARLY = os.environ.get("STRIPE_PRICE_ID_YEARLY", "")
+
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 
-# Accept either JSON string or file path under common env names
+# Accept JSON string or file path under common env names
 FIREBASE_SERVICE_ACCOUNT_JSON = (
     os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
     or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
@@ -25,6 +32,11 @@ FIREBASE_SERVICE_ACCOUNT_JSON = (
 
 # Optional CORS allowlist (comma-separated origins). If blank, allow all.
 CORS_ALLOW = os.environ.get("CORS_ALLOW") or os.environ.get("CORS_ORIGINS") or "*"
+
+# Whitelist allowed Stripe Prices (prevents tampering from the client)
+ALLOWED_PRICE_IDS = [
+    p for p in [STRIPE_PRICE_ID_MONTHLY, STRIPE_PRICE_ID_YEARLY] if p
+]
 
 stripe.api_key = STRIPE_SECRET_KEY
 
@@ -82,16 +94,32 @@ def get_or_create_customer_for_uid(uid: str):
     return customer["id"]
 
 def write_subscription_status(uid: str, customer_id: str, subscription_obj: dict):
-    """Write subscription fields to Firestore: organizer_subs/{uid}"""
+    """
+    Write subscription fields to Firestore: organizer_subs/{uid}
+    Includes plan (price_id, interval), amount, currency, status, and period end.
+    """
     status = subscription_obj.get("status")
+
     current_period_end = subscription_obj.get("current_period_end")  # unix ts (sec)
     current_period_end_ms = int(current_period_end) * 1000 if current_period_end else None
+
+    # Extract plan/price info from first item
+    items = (subscription_obj.get("items", {}) or {}).get("data") or []
+    first = items[0] if items else {}
+    price = (first or {}).get("price") or {}
+    recurring = price.get("recurring") or {}
+
     doc_ref = db.collection("organizer_subs").document(uid)
     payload = {
         "status": status,
         "current_period_end": firestore.SERVER_TIMESTAMP if current_period_end_ms is None else current_period_end_ms,
         "stripe_customer_id": customer_id,
         "stripe_subscription_id": subscription_obj.get("id"),
+        # Plan details
+        "price_id": price.get("id"),
+        "interval": recurring.get("interval"),      # "month" | "year"
+        "amount_cents": price.get("unit_amount"),
+        "currency": price.get("currency"),
         "updated_at": firestore.SERVER_TIMESTAMP,
     }
     doc_ref.set(payload, merge=True)
@@ -113,8 +141,15 @@ def create_subscription():
     success_url = data.get("success_url")
     cancel_url = data.get("cancel_url")
 
-    if not (uid and success_url and cancel_url and STRIPE_PRICE_ID):
-        return jsonify({"error": "Missing uid/success_url/cancel_url or STRIPE_PRICE_ID"}), 400
+    # NEW: accept price_id from client, default to monthly
+    price_id = data.get("price_id") or STRIPE_PRICE_ID_MONTHLY
+
+    if not (uid and success_url and cancel_url and price_id):
+        return jsonify({"error": "Missing uid/success_url/cancel_url or price_id"}), 400
+
+    # Prevent tampering: only allow known price IDs
+    if price_id not in ALLOWED_PRICE_IDS:
+        return jsonify({"error": "Invalid price_id"}), 400
 
     try:
         customer_id = get_or_create_customer_for_uid(uid)
@@ -122,7 +157,7 @@ def create_subscription():
             mode="subscription",
             payment_method_types=["card"],
             customer=customer_id,
-            line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
+            line_items=[{"price": price_id, "quantity": 1}],
             success_url=success_url,
             cancel_url=cancel_url,
             client_reference_id=uid,
