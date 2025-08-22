@@ -216,3 +216,52 @@ def webhook():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
+
+
+# ===== New: One-time paid Pot creation =====
+POT_CREATE_PRICE_CENTS = int(os.environ.get("POT_CREATE_PRICE_CENTS", "1000"))  # default $10, set via env
+
+@app.post("/create-pot-session")
+def create_pot_session():
+    data = request.get_json(force=True, silent=True) or {}
+    draft = data.get("draft") or {}
+    success_url = data.get("success_url")
+    cancel_url = data.get("cancel_url")
+    amount_cents = int(data.get("amount_cents") or POT_CREATE_PRICE_CENTS)
+
+    if not (success_url and cancel_url):
+        return jsonify({"error":"Missing success_url/cancel_url"}), 400
+    if amount_cents < 50:
+        return jsonify({"error":"Minimum amount is 50 cents"}), 400
+
+    ref = db.collection("pot_drafts").document()
+    draft_id = ref.id
+    ref.set({
+        **draft,
+        "status": "pending",
+        "created_at": firestore.SERVER_TIMESTAMP
+    }, merge=True)
+
+    try:
+        session = stripe.checkout.Session.create(
+            mode="payment",
+            payment_method_types=["card"],
+            line_items=[{
+                "price_data": {
+                    "currency": "usd",
+                    "unit_amount": amount_cents,
+                    "product_data": {"name": f"Create Pot — {draft.get('name') or 'Tournament'}"}
+                },
+                "quantity": 1
+            }],
+            success_url=success_url,
+            cancel_url=cancel_url,
+            metadata={
+                "type": "create_pot",
+                "draft_id": draft_id
+            }
+        )
+        return jsonify({"url": session.url, "draft_id": draft_id})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
