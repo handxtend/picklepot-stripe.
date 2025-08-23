@@ -1,6 +1,4 @@
-Flask
-flask-cors
-stripe
-firebase-admin
-gunicorn
-# sendgrid  # uncomment when you start emailing
+fastapi==0.111.0
+uvicorn[standard]==0.30.0
+stripe==8.8.0
+firebase-admin==6.5.0
