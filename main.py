@@ -85,6 +85,48 @@ async def create_pot_session(payload: dict):
     return {"draft_id": draft_ref.id, "url": session.url}
 
 # ---------- 2) Cancel: delete the draft ----------
+
+# ---------- JOIN: Create Checkout Session for "Join a Pot" ----------
+@app.post("/create-checkout-session")
+async def create_checkout_session(payload: dict):
+    """
+    Body: { pot_id, entry_id, amount_cents, player_name?, player_email?, success_url, cancel_url }
+    Returns: { url }
+    """
+    pot_id = payload.get("pot_id")
+    entry_id = payload.get("entry_id")
+    amount_cents = int(payload.get("amount_cents") or 0)
+    success_url = payload.get("success_url")
+    cancel_url = payload.get("cancel_url")
+    player_email = payload.get("player_email")
+
+    if amount_cents < 50:
+        raise HTTPException(status_code=400, detail="Amount must be at least 50 cents.")
+    if not success_url or not cancel_url:
+        raise HTTPException(status_code=400, detail="Missing success/cancel URLs")
+
+    # Create Stripe Checkout Session for this entry
+    session = stripe.checkout.Session.create(
+        mode="payment",
+        line_items=[{
+            "price_data": {
+                "currency": "usd",
+                "product_data": {"name": f"Join Pot {pot_id or ''}"},
+                "unit_amount": amount_cents,
+            },
+            "quantity": 1
+        }],
+        success_url=f"{success_url}?session_id={{CHECKOUT_SESSION_ID}}",
+        cancel_url=f"{cancel_url}?session_id={{CHECKOUT_SESSION_ID}}",
+        customer_email=player_email or None,
+        metadata={
+            "flow": "join",
+            "pot_id": pot_id or "",
+            "entry_id": entry_id or ""
+        },
+    )
+    return {"url": session.url}
+
 @app.post("/cancel-pot-session")
 async def cancel_pot_session(payload: dict):
     """
@@ -139,5 +181,20 @@ async def stripe_webhook(request: Request):
 
                 # Remove the draft (or mark status)
                 draft_ref.delete()
+
+        else:
+            # Handle Join-a-Pot payments
+            md = session.get("metadata") or {}
+            pot_id = md.get("pot_id")
+            entry_id = md.get("entry_id")
+            if pot_id and entry_id:
+                entry_ref = db.collection("pots").document(pot_id).collection("entries").document(entry_id)
+                entry_ref.set({
+                    "paid": True,
+                    "paid_amount": session.get("amount_total"),
+                    "paid_at": utcnow(),
+                    "payment_method": "stripe",
+                    "stripe_session_id": session["id"],
+                }, merge=True)
 
     return JSONResponse({"received": True})
