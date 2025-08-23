@@ -91,14 +91,38 @@ async def create_pot_session(payload: dict, request: Request):
 
 @app.get("/cancel-create")
 def cancel_create(session_id: str, next: str = "/"):
-    """Stripe Cancel redirect (Create-a-Pot): delete draft then send user back."""
+    """Stripe Cancel redirect (Create-a-Pot): delete any draft and any already-created pot (defensive), then send user back."""
+    # Look up mapping to find draft_id
     map_ref = db.collection("create_sessions").document(session_id)
     snap = map_ref.get()
+    draft_id = None
     if snap.exists:
         draft_id = (snap.to_dict() or {}).get("draft_id")
-        if draft_id:
-            db.collection("pot_drafts").document(draft_id).delete()
-        map_ref.delete()
+
+    # 1) Delete the draft if present
+    if draft_id:
+        db.collection("pot_drafts").document(draft_id).delete()
+
+        # 2) Defensive cleanup: if a pot was created prematurely, remove it.
+        #    Delete pots linked by draft_id
+        try:
+            for pot_doc in db.collection("pots").where("draft_id", "==", draft_id).stream():
+                pot_doc.reference.delete()
+        except Exception:
+            # Some SDKs require composite indexes; if query fails, ignore.
+            pass
+
+    # Also defensive: remove any pot that used this Stripe session id
+    try:
+        for pot_doc in db.collection("pots").where("stripe_session_id", "==", session_id).stream():
+            pot_doc.reference.delete()
+    except Exception:
+        pass
+
+    # Clean the mapping
+    map_ref.delete()
+
+    # Redirect back to the front-end cancel page
     return RedirectResponse(next, status_code=302)
 
 # ====== JOIN A POT ======
