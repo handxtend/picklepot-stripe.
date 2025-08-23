@@ -1,18 +1,23 @@
+
 import os, json
 from datetime import datetime, timezone
+from urllib.parse import quote
 
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 import stripe
 import firebase_admin
 from firebase_admin import credentials, firestore
 
-# ---------- Environment ----------
+# ---------- ENV ----------
 stripe.api_key = os.environ["STRIPE_SECRET_KEY"]
 WEBHOOK_SECRET = os.environ["STRIPE_WEBHOOK_SECRET"]
 POT_CREATE_PRICE_CENT = int(os.getenv("POT_CREATE_PRICE_CENT", "1000"))  # 500 => $5
+
+REQUIRE_ADMIN_TOGGLE = os.getenv("REQUIRE_ADMIN_TOGGLE", "false").lower() in ("1","true","yes")
+ADMIN_TOGGLE_KEY = os.getenv("ADMIN_TOGGLE_KEY", "")  # optional shared secret header 'X-Admin-Key'
 
 # Firebase Admin
 cred = credentials.Certificate(json.loads(os.environ["FIREBASE_SERVICE_ACCOUNT_JSON"]))
@@ -21,172 +26,213 @@ firebase_admin.initialize_app(cred, {
 })
 db = firestore.client()
 
-# ---------- App ----------
+# ---------- APP ----------
 app = FastAPI(title="PicklePot Stripe Backend")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # tighten to your frontend origins if you want
+    allow_origins=["*"],    # tighten to your domains if desired
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+def utcnow(): return datetime.now(timezone.utc)
+
+@app.get("/", include_in_schema=False)
+def root():
+    return {"ok": True, "service": "picklepot-stripe", "try": ["/health", "/create-pot-session", "/create-checkout-session", "/webhook"]}
+
+@app.head("/", include_in_schema=False)
+def head_root(): return Response(status_code=200)
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon(): return Response(status_code=204)
+
 @app.get("/health")
-def health():
-    return {"ok": True, "price_cents": POT_CREATE_PRICE_CENT}
+def health(): return {"ok": True, "price_cents": POT_CREATE_PRICE_CENT}
 
 # ---------- Helpers ----------
-def utcnow():
-    return datetime.now(timezone.utc)
+def server_base(request: Request) -> str:
+    return f"{request.url.scheme}://{request.headers.get('host')}"
 
-# ---------- 1) Create Checkout Session ----------
+def is_admin_request(request: Request) -> bool:
+    if not REQUIRE_ADMIN_TOGGLE:
+        return True  # compatibility mode: do not enforce unless asked
+    return request.headers.get("x-admin-key", "") == ADMIN_TOGGLE_KEY
+
+# ---------- CREATE POT (Organizer) ----------
 @app.post("/create-pot-session")
-async def create_pot_session(payload: dict):
+async def create_pot_session(payload: dict, request: Request):
     """
-    Body:
-      { draft: {...}, success_url: "...", cancel_url: "..." }
-    Returns:
-      { draft_id, url }
+    Body: { draft: {...}, success_url, cancel_url }
+    Returns: { draft_id, url }
     """
     draft = payload.get("draft")
     success_url = payload.get("success_url")
-    cancel_url = payload.get("cancel_url")
-
-    if not draft:
-        raise HTTPException(status_code=400, detail="Missing draft")
+    cancel_url  = payload.get("cancel_url")
+    if not draft:        raise HTTPException(400, "Missing draft")
     if not success_url or not cancel_url:
-        raise HTTPException(status_code=400, detail="Missing success/cancel URLs")
+        raise HTTPException(400, "Missing success/cancel URLs")
 
-    # 1) Save draft in Firestore
-    draft_ref = db.collection("pot_drafts").document()
-    draft_to_store = {
-        **draft,
-        "status": "draft",
-        "createdAt": utcnow(),
-    }
-    draft_ref.set(draft_to_store)
+    # Enforce admin-only toggle for Stripe payments if required
+    pm = draft.get("payment_methods", {}) if isinstance(draft.get("payment_methods"), dict) else {}
+    allow_stripe_client = bool(pm.get("stripe"))
+    if REQUIRE_ADMIN_TOGGLE and allow_stripe_client and not is_admin_request(request):
+        # force off if caller isn't admin
+        pm["stripe"] = False
+        draft["payment_methods"] = pm
 
-    # 2) Stripe Checkout Session
-    session = stripe.checkout.Session.create(
+    # 1) Save draft
+    ref = db.collection("pot_drafts").document()
+    ref.set({**draft, "status": "draft", "createdAt": utcnow()})
+
+    # 2) Stripe Checkout
+    sess = stripe.checkout.Session.create(
         mode="payment",
         line_items=[{
             "price_data": {
                 "currency": "usd",
                 "product_data": {"name": "Create a Pot"},
-                "unit_amount": POT_CREATE_PRICE_CENT,  # e.g. 500 = $5
+                "unit_amount": POT_CREATE_PRICE_CENT,
             },
-            "quantity": 1
+            "quantity": 1,
         }],
         success_url=f"{success_url}?flow=create&session_id={{CHECKOUT_SESSION_ID}}",
-        cancel_url=f"{cancel_url}?flow=create&session_id={{CHECKOUT_SESSION_ID}}",
-        metadata={"draft_id": draft_ref.id, "flow": "create"},
+        # IMPORTANT: route cancel through backend to delete draft automatically, then redirect to front-end
+        cancel_url=f"{server_base(request)}/cancel-create?session_id={{CHECKOUT_SESSION_ID}}&next={quote(cancel_url)}",
+        metadata={"draft_id": ref.id, "flow": "create"},
     )
 
-    return {"draft_id": draft_ref.id, "url": session.url}
+    # Map session -> draft so we can delete on cancel without relying on the front-end
+    db.collection("create_sessions").document(sess["id"]).set({
+        "draft_id": ref.id,
+        "createdAt": utcnow(),
+    })
 
-# ---------- 2) Cancel: delete the draft ----------
+    return {"draft_id": ref.id, "url": sess.url}
 
-# ---------- JOIN: Create Checkout Session for "Join a Pot" ----------
+@app.get("/cancel-create")
+def cancel_create(session_id: str, next: str = "/"):
+    """Server-handled cancel for 'create pot': delete the draft (if any) and redirect to the front-end cancel page."""
+    doc = db.collection("create_sessions").document(session_id).get()
+    if doc.exists:
+        draft_id = doc.to_dict().get("draft_id")
+        if draft_id:
+            db.collection("pot_drafts").document(draft_id).delete()
+        db.collection("create_sessions").document(session_id).delete()
+    return RedirectResponse(next, status_code=302)
+
+@app.post("/cancel-pot-session")
+async def cancel_pot_session(payload: dict):
+    """Legacy cancel handler used by older front-ends; still supported."""
+    draft_id = payload.get("draft_id")
+    if not draft_id: raise HTTPException(400, "Missing draft_id")
+    db.collection("pot_drafts").document(draft_id).delete()
+    return {"ok": True}
+
+# ---------- JOIN POT (Player) ----------
 @app.post("/create-checkout-session")
-async def create_checkout_session(payload: dict):
+async def create_checkout_session(payload: dict, request: Request):
     """
-    Body: { pot_id, entry_id, amount_cents, player_name?, player_email?, success_url, cancel_url }
-    Returns: { url }
+    Body: { pot_id, entry_id, amount_cents, success_url, cancel_url }
+    Returns: { url, session_id }
     """
     pot_id = payload.get("pot_id")
     entry_id = payload.get("entry_id")
     amount_cents = int(payload.get("amount_cents") or 0)
     success_url = payload.get("success_url")
     cancel_url = payload.get("cancel_url")
-    player_email = payload.get("player_email")
 
-    if amount_cents < 50:
-        raise HTTPException(status_code=400, detail="Amount must be at least 50 cents.")
+    if not pot_id or not entry_id:
+        raise HTTPException(400, "Missing pot_id or entry_id")
+    if amount_cents <= 0:
+        raise HTTPException(400, "Invalid amount")
     if not success_url or not cancel_url:
-        raise HTTPException(status_code=400, detail="Missing success/cancel URLs")
+        raise HTTPException(400, "Missing success/cancel URLs")
 
-    # Create Stripe Checkout Session for this entry
-    session = stripe.checkout.Session.create(
+    sess = stripe.checkout.Session.create(
         mode="payment",
         line_items=[{
             "price_data": {
                 "currency": "usd",
-                "product_data": {"name": f"Join Pot {pot_id or ''}"},
+                "product_data": {"name": f"Join Pot {pot_id}"},
                 "unit_amount": amount_cents,
             },
-            "quantity": 1
+            "quantity": 1,
         }],
-        success_url=f"{success_url}?session_id={{CHECKOUT_SESSION_ID}}",
-        cancel_url=f"{cancel_url}?session_id={{CHECKOUT_SESSION_ID}}",
-        customer_email=player_email or None,
-        metadata={
-            "flow": "join",
-            "pot_id": pot_id or "",
-            "entry_id": entry_id or ""
-        },
+        success_url=f"{success_url}?flow=join&session_id={{CHECKOUT_SESSION_ID}}&pot_id={pot_id}&entry_id={entry_id}",
+        # Route cancel through backend to remove the pending entry automatically, then redirect
+        cancel_url=f"{server_base(request)}/cancel-join?session_id={{CHECKOUT_SESSION_ID}}&pot_id={pot_id}&entry_id={entry_id}&next={quote(cancel_url)}",
+        metadata={"flow": "join", "pot_id": pot_id, "entry_id": entry_id},
     )
-    return {"url": session.url}
 
-@app.post("/cancel-pot-session")
-async def cancel_pot_session(payload: dict):
-    """
-    Body:
-      { draft_id, session_id? }
-    Deletes the draft if it exists.
-    """
-    draft_id = payload.get("draft_id")
-    if not draft_id:
-        raise HTTPException(status_code=400, detail="Missing draft_id")
+    # Map session -> {pot_id, entry_id} for cancel path
+    db.collection("join_sessions").document(sess["id"]).set({
+        "pot_id": pot_id, "entry_id": entry_id, "createdAt": utcnow()
+    })
 
-    # delete (or you could mark status: "canceled")
-    db.collection("pot_drafts").document(draft_id).delete()
-    return {"ok": True}
+    return {"url": sess.url, "session_id": sess["id"]}
 
-# ---------- 3) Stripe Webhook ----------
+@app.get("/cancel-join")
+def cancel_join(session_id: str, pot_id: str = None, entry_id: str = None, next: str = "/"):
+    """Server-handled cancel for 'join pot': delete the pending entry (if any) and redirect to front-end cancel page."""
+    meta = db.collection("join_sessions").document(session_id).get()
+    if meta.exists:
+        data = meta.to_dict()
+        pot_id = pot_id or data.get("pot_id")
+        entry_id = entry_id or data.get("entry_id")
+        db.collection("join_sessions").document(session_id).delete()
+
+    if pot_id and entry_id:
+        # Remove the entry if it still exists and isn't marked paid
+        entry_ref = db.collection("pots").document(pot_id).collection("entries").document(entry_id)
+        snap = entry_ref.get()
+        if snap.exists:
+            entry = snap.to_dict() or {}
+            if not entry.get("paid"):
+                entry_ref.delete()
+
+    return RedirectResponse(next, status_code=302)
+
+# ---------- STRIPE WEBHOOK ----------
 @app.post("/webhook")
-async def stripe_webhook(request: Request):
-    # Stripe needs the RAW body (do not parse as JSON before verification)
+async def webhook(request: Request):
     payload = await request.body()
-    sig_header = request.headers.get("stripe-signature")
-
+    sig = request.headers.get("stripe-signature")
     try:
-        event = stripe.Webhook.construct_event(payload, sig_header, WEBHOOK_SECRET)
+        event = stripe.Webhook.construct_event(payload, sig, WEBHOOK_SECRET)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(400, str(e))
 
     if event["type"] == "checkout.session.completed":
         session = event["data"]["object"]
-        draft_id = (session.get("metadata") or {}).get("draft_id")
-        if draft_id:
-            # Idempotency: use session.id as the Pot document id
-            pot_doc = db.collection("pots").document(session["id"])
+        flow = (session.get("metadata") or {}).get("flow")
 
-            if not pot_doc.get().exists:
-                # Get and remove the draft
-                draft_ref = db.collection("pot_drafts").document(draft_id)
-                draft_snap = draft_ref.get()
-                draft = draft_snap.to_dict() if draft_snap.exists else {}
+        if flow == "create":
+            draft_id = (session.get("metadata") or {}).get("draft_id")
+            if draft_id:
+                pots_ref = db.collection("pots").document(session["id"])
+                if not pots_ref.get().exists:
+                    draft_ref = db.collection("pot_drafts").document(draft_id)
+                    draft_snap = draft_ref.get()
+                    draft = draft_snap.to_dict() if draft_snap.exists else {}
+                    pots_ref.set({
+                        **(draft or {}),
+                        "status": "active",
+                        "createdAt": utcnow(),
+                        "source": "checkout",
+                        "draft_id": draft_id,
+                        "stripe_session_id": session["id"],
+                        "amount_total": session.get("amount_total"),
+                        "currency": session.get("currency", "usd"),
+                    })
+                    draft_ref.delete()
+                # clean mapping
+                db.collection("create_sessions").document(session["id"]).delete()
 
-                # Create the real Pot (you can map/transform fields as you like)
-                pot_doc.set({
-                    **(draft or {}),
-                    "status": "active",
-                    "createdAt": utcnow(),
-                    "source": "checkout",
-                    "draft_id": draft_id,
-                    "stripe_session_id": session["id"],
-                    "amount_total": session.get("amount_total"),
-                    "currency": session.get("currency", "usd"),
-                })
-
-                # Remove the draft (or mark status)
-                draft_ref.delete()
-
-        else:
-            # Handle Join-a-Pot payments
-            md = session.get("metadata") or {}
-            pot_id = md.get("pot_id")
-            entry_id = md.get("entry_id")
+        elif flow == "join":
+            pot_id = (session.get("metadata") or {}).get("pot_id")
+            entry_id = (session.get("metadata") or {}).get("entry_id")
             if pot_id and entry_id:
                 entry_ref = db.collection("pots").document(pot_id).collection("entries").document(entry_id)
                 entry_ref.set({
@@ -196,5 +242,7 @@ async def stripe_webhook(request: Request):
                     "payment_method": "stripe",
                     "stripe_session_id": session["id"],
                 }, merge=True)
+                # clean mapping
+                db.collection("join_sessions").document(session["id"]).delete()
 
     return JSONResponse({"received": True})
