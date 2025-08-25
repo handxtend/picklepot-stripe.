@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: picklepot-stripe
+    env: python
+    plan: free
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: FIRESTORE_PROJECT_ID
+        sync: false
+      - key: CORS_ALLOW
+        value: "*"
+      - key: POT_CREATE_PRICE_CENT
+        value: "1000"
+      - key: LOG_LEVEL
+        value: "INFO"
+      - key: STRIPE_PRICE_ID_INDIVIDUAL_MONTHLY
+        sync: false
+      - key: STRIPE_PRICE_ID_INDIVIDUAL_YEARLY
+        sync: false
+      - key: STRIPE_PRICE_ID_CLUB_MONTHLY
+        sync: false
+      - key: STRIPE_PRICE_ID_CLUB_YEARLY
+        sync: false
