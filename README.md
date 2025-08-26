@@ -1,17 +1,8 @@
-# PicklePot Backend — Unified (Render‑friendly)
+# Owner Flows + Finalize Fallback
 
-- Multi‑pot creation via Stripe (`count`)
-- Owner codes + magic links
-- Rotate owner code, rotate link (salt), revoke‑all
-- Join‑a‑Pot checkout marks entry paid
-- Optional organizer subscriptions
-- Lighter requirements for Render builds
+New:
+- `GET /created-pots?session_id=...`
+- `POST /finalize-create?session_id=...`  ← creates the pots if webhook didn't
+- Owner endpoints for listing entries and manual paid.
 
-## Deploy
-- Build Command:
-  ```
-  pip install --upgrade pip setuptools wheel
-  pip install -r requirements.txt
-  ```
-- Start Command: `uvicorn main:app --host 0.0.0.0 --port $PORT`
-- runtime.txt pins Python 3.11.9
+Call `POST /finalize-create` from the success page if `/created-pots` returns empty.
