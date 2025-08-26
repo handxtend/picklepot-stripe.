@@ -1,7 +1,7 @@
-fastapi==0.111.0
-uvicorn==0.30.0
-stripe==8.8.0
-firebase-admin==6.5.0
-pydantic==2.8.2
-pydantic-core==2.20.1
+fastapi>=0.111.0
+uvicorn>=0.30.0
+stripe>=7.9.0
+firebase-admin>=6.3.0
+google-cloud-firestore>=2.16.0
+pydantic>=2.7.0
 typing-extensions>=4.12.2
