@@ -1,406 +1,480 @@
-# FastAPI backend for PicklePot (consolidated & patched)
-# - CORS from CORS_ALLOW env (comma-separated origins)
-# - Firestore via FIREBASE_SERVICE_ACCOUNT_JSON (JSON string or path) or ADC
-# - Stripe endpoints for creating pot sessions (organizer) and join sessions (players)
-# - Webhook processes checkout.session.completed
-# - Success helpers: /created-pots & /finalize-create
-# - Owner utilities: list entries, add manual entry, mark paid, undo paid
-# - Owner token uses HMAC(pot_id, OWNER_TOKEN_SECRET) with base64url (no padding)
-#
-# Start command on Render: uvicorn main:app --host 0.0.0.0 --port $PORT
+import os, json, logging, base64, hashlib, hmac, time, secrets
+from datetime import datetime, timezone
+from typing import Dict, Any, Optional
+from urllib.parse import quote
 
-import os, json, base64, hmac, hashlib, secrets, datetime
-from typing import Optional, List, Dict, Any
-
-from fastapi import FastAPI, HTTPException, Body, Query
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# ---- Stripe (optional for local dev) ----
-STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
-try:
-    import stripe  # type: ignore
-    if STRIPE_SECRET_KEY:
-        stripe.api_key = STRIPE_SECRET_KEY
-except Exception:
-    stripe = None  # allow server to run without stripe for non-checkout routes
+import stripe
+import firebase_admin
+from firebase_admin import credentials, firestore
 
-# ---- Firestore setup ----
-import firebase_admin  # type: ignore
-from firebase_admin import credentials, firestore  # type: ignore
+# =========================
+# Logging
+# =========================
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+log = logging.getLogger("picklepot-fastapi")
 
-_db = None
-def get_db():
-    global _db
-    if _db is not None:
-        return _db
-    cred_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
-    if cred_json:
-        if cred_json.strip().startswith("{"):
-            cred = credentials.Certificate(json.loads(cred_json))
-        else:
-            cred = credentials.Certificate(cred_json)
-        if not firebase_admin._apps:
-            firebase_admin.initialize_app(cred)
+# =========================
+# Environment
+# =========================
+stripe.api_key = os.environ["STRIPE_SECRET_KEY"]
+WEBHOOK_SECRET = os.environ["STRIPE_WEBHOOK_SECRET"]
+OWNER_TOKEN_SECRET = os.getenv("OWNER_TOKEN_SECRET", "CHANGE-ME")  # set strong value
+FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "https://picklepotters.netlify.app")
+POT_CREATE_PRICE_CENT = int(os.getenv("POT_CREATE_PRICE_CENT", "1000"))
+CORS_ALLOW = os.getenv("CORS_ALLOW") or os.getenv("CORS_ORIGINS") or "*"
+
+# Optional subscription price IDs
+IND_M = os.getenv("STRIPE_PRICE_ID_INDIVIDUAL_MONTHLY", "")
+IND_Y = os.getenv("STRIPE_PRICE_ID_INDIVIDUAL_YEARLY", "")
+CLB_M = os.getenv("STRIPE_PRICE_ID_CLUB_MONTHLY", "")
+CLB_Y = os.getenv("STRIPE_PRICE_ID_CLUB_YEARLY", "")
+PLAN_CONFIG: Dict[str, Dict[str, Any]] = {
+    IND_M: {"plan":"individual","interval":"month","pots_per_month":2,"max_users_per_event":12},
+    IND_Y: {"plan":"individual","interval":"year","pots_per_month":2,"max_users_per_event":12},
+    CLB_M: {"plan":"club","interval":"month","pots_per_month":10,"max_users_per_event":64},
+    CLB_Y: {"plan":"club","interval":"year","pots_per_month":10,"max_users_per_event":64},
+}
+ALLOWED_PRICE_IDS = [p for p in {IND_M, IND_Y, CLB_M, CLB_Y} if p]
+
+# Firebase
+cred_json = os.environ["FIREBASE_SERVICE_ACCOUNT_JSON"]
+fb_project = os.getenv("FIRESTORE_PROJECT_ID")
+cred = credentials.Certificate(json.loads(cred_json))
+if not firebase_admin._apps:
+    if fb_project:
+        firebase_admin.initialize_app(cred, {"projectId": fb_project})
     else:
-        if not firebase_admin._apps:
-            firebase_admin.initialize_app()
-    _db = firestore.client()
-    return _db
+        firebase_admin.initialize_app(cred)
+db = firestore.client()
 
-db = get_db()
-
+# =========================
+# Helpers
+# =========================
 def utcnow():
-    return datetime.datetime.utcnow().isoformat() + "Z"
+    return datetime.now(timezone.utc)
 
-# ---- Owner token helpers (patched) ----
-OWNER_TOKEN_SECRET = os.getenv("OWNER_TOKEN_SECRET", "").strip()
+def server_base(request: Request) -> str:
+    return f"{request.url.scheme}://{request.headers.get('host')}"
 
-def _hmac_key(pot_id: str, secret: str) -> str:
-    dig = hmac.new(secret.encode("utf-8"), pot_id.encode("utf-8"), hashlib.sha256).digest()
-    return base64.urlsafe_b64encode(dig).rstrip(b"=").decode("utf-8")
+def b64url_encode(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).decode().rstrip("=")
 
-def generate_owner_key(pot_id: str) -> str:
-    if not OWNER_TOKEN_SECRET:
-        raise RuntimeError("OWNER_TOKEN_SECRET not set")
-    return _hmac_key(pot_id, OWNER_TOKEN_SECRET)
+def b64url_decode(s: str) -> bytes:
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
 
-def verify_owner_token(pot_id: str, key: str) -> bool:
-    """Accept key if it matches the current HMAC or a stored owner_key on the pot document."""
-    if OWNER_TOKEN_SECRET:
-        expected = _hmac_key(pot_id, OWNER_TOKEN_SECRET)
-        if secrets.compare_digest(expected, key):
-            return True
-    pot_ref = db.collection("pots").document(pot_id)
-    snap = pot_ref.get()
-    if snap.exists:
-        pot = snap.to_dict() or {}
-        stored = pot.get("owner_key") or pot.get("ownerKey")
-        if stored and secrets.compare_digest(stored, key):
-            return True
-    return False
+def random_owner_code(length_bytes: int = 5) -> str:
+    code = base64.b32encode(secrets.token_bytes(length_bytes)).decode().rstrip("=")
+    return code.replace("O","8").replace("I","9")
 
-# ---- App + CORS ----
-FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "").strip() or "http://localhost:5500"
-CORS_ALLOW = [o.strip() for o in os.getenv("CORS_ALLOW", FRONTEND_BASE_URL).split(",") if o.strip()]
+def hash_code(code: str) -> str:
+    return hashlib.sha256(("pp_salt_"+code).encode()).hexdigest()
 
-app = FastAPI(title="picklepot-fastapi")
+def _pot_token_salt(pot_id: str) -> str:
+    snap = db.collection("pots").document(pot_id).get()
+    data = snap.to_dict() if snap.exists else {}
+    return (data or {}).get("owner_token_salt", "")
 
+def make_owner_token(pot_id: str) -> str:
+    ts = int(time.time())
+    payload = f"{pot_id}.{ts}"
+    key = (OWNER_TOKEN_SECRET + "|" + _pot_token_salt(pot_id)).encode()
+    mac = hmac.new(key, payload.encode(), hashlib.sha256).digest()[:16]
+    return f"{b64url_encode(payload.encode())}.{b64url_encode(mac)}"
+
+def verify_owner_token(pot_id: str, token: str) -> bool:
+    try:
+        p_b64, mac_b64 = token.split(".")
+        payload = b64url_decode(p_b64).decode()
+        pot, ts_s = payload.split(".")
+        if pot != pot_id:
+            return False
+        mac = b64url_decode(mac_b64)
+        key = (OWNER_TOKEN_SECRET + "|" + _pot_token_salt(pot_id)).encode()
+        exp = hmac.new(key, payload.encode(), hashlib.sha256).digest()[:16]
+        return hmac.compare_digest(mac, exp)
+    except Exception:
+        return False
+
+# =========================
+# FastAPI
+# =========================
+app = FastAPI(title="PicklePot Backend — Multi-Pot + Owner Links (Rotate/Revoke)")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ALLOW or ["*"],
+    allow_origins=["*"] if (CORS_ALLOW == "*" or not CORS_ALLOW) else [o.strip() for o in CORS_ALLOW.split(",") if o.strip()],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---- Health ----
-@app.get("/")
+# ---------- Health ----------
+@app.get("/", include_in_schema=False)
 def root():
-    return {"ok": True, "service": "picklepot-fastapi", "try": ["/health","/create-pot-session","/create-checkout-session","/webhook"]}
+    return {"ok": True, "service": "picklepot-stripe", "try": ["/health", "/create-pot-session", "/create-checkout-session", "/webhook"]}
 
 @app.get("/health")
-def health_check():
-    return {"ok": True, "timestamp": utcnow()}
+def health():
+    log.info("health_check", extra={"price_cents": POT_CREATE_PRICE_CENT})
+    return {"ok": True, "price_cents": POT_CREATE_PRICE_CENT}
 
-# ---- Models ----
-class CreatePotRequest(BaseModel):
-    pot_qty: int = 1
-    organizer_email: Optional[str] = ""
-    settings_json: Optional[str] = ""  # arbitrary JSON string from your form (optional)
+# ---------- Create-a-Pot (multi) ----------
+class CreatePotPayload(BaseModel):
+    draft: Dict[str, Any] | None = None
+    success_url: str
+    cancel_url: str
+    amount_cents: Optional[int] = None
+    count: Optional[int] = 1
 
-class JoinPotRequest(BaseModel):
-    pot_id: str
-    player_name: Optional[str] = ""
-    player_email: Optional[str] = ""
-
-class ManualEntryIn(BaseModel):
-    name: Optional[str] = ""
-    email: Optional[str] = ""
-
-class ManualPaymentIn(BaseModel):
-    amount_cents: int = 0
-    method: str = "cash"
-    note: Optional[str] = ""
-
-# ---- Stripe: create session for organizer (create pots) ----
 @app.post("/create-pot-session")
-def create_pot_session(body: CreatePotRequest):
-    if not stripe or not STRIPE_SECRET_KEY:
-        raise HTTPException(500, "Stripe not configured")
-    pot_qty = max(1, min(20, int(body.pot_qty or 1)))
-    price_cents = int(os.getenv("POT_CREATE_PRICE_CENT", "1500") or "1500")
-    currency = "usd"
+async def create_pot_session(payload: CreatePotPayload, request: Request):
+    draft = payload.draft or {}
+    success_url = payload.success_url
+    cancel_url  = payload.cancel_url
+    amount_cents = int(payload.amount_cents or POT_CREATE_PRICE_CENT)
+    count = max(1, int(payload.count or 1))
 
-    # We create a one-time PaymentLink/CheckoutSession
-    try:
-        session = stripe.checkout.Session.create(
-            mode="payment",
-            payment_method_types=["card"],
-            line_items=[{
-                "price_data": {
-                    "currency": currency,
-                    "product_data": {"name": f"Create Pots (x{pot_qty})"},
-                    "unit_amount": price_cents,
-                },
-                "quantity": pot_qty,
-            }],
-            success_url=f"{FRONTEND_BASE_URL}/success.html?session_id={{CHECKOUT_SESSION_ID}}",
-            cancel_url=f"{FRONTEND_BASE_URL}/cancel.html",
-            metadata={
-                "type": "create",
-                "pot_qty": str(pot_qty),
-                "organizer_email": body.organizer_email or "",
-                "settings_json": body.settings_json or "",
+    log.info("create_pot_session_request", extra={"amount_cents": amount_cents, "count": count})
+    if not success_url or not cancel_url:
+        raise HTTPException(400, "Missing success/cancel URLs")
+    if amount_cents < 50:
+        raise HTTPException(400, "Minimum amount is 50 cents")
+
+    draft_ref = db.collection("pot_drafts").document()
+    draft_ref.set({**draft, "status": "draft", "createdAt": utcnow()}, merge=True)
+
+    session = stripe.checkout.Session.create(
+        mode="payment",
+        line_items=[{
+            "price_data": {
+                "currency": "usd",
+                "product_data": {"name": f"Create Pot — {draft.get('name') or 'Tournament'}"},
+                "unit_amount": amount_cents,
             },
-        )
-        return {"id": session.get("id")}
-    except Exception as e:
-        raise HTTPException(500, f"stripe-error: {e}")
+            "quantity": count,
+        }],
+        success_url=f"{success_url}?flow=create&session_id={{CHECKOUT_SESSION_ID}}",
+        cancel_url=f"{server_base(request)}/cancel-create?session_id={{CHECKOUT_SESSION_ID}}&next={quote(cancel_url)}",
+        metadata={"draft_id": draft_ref.id, "flow": "create", "count": str(count)},
+    )
 
-# ---- Stripe: create session for a player to join a pot ----
+    db.collection("create_sessions").document(session["id"]).set({
+        "draft_id": draft_ref.id,
+        "count": count,
+        "createdAt": utcnow(),
+    })
+
+    return {"draft_id": draft_ref.id, "url": session.url, "count": count}
+
+@app.get("/cancel-create")
+def cancel_create(session_id: str, next: str = "/"):
+    map_ref = db.collection("create_sessions").document(session_id)
+    snap = map_ref.get()
+    draft_id = (snap.to_dict() or {}).get("draft_id") if snap.exists else None
+
+    if draft_id:
+        db.collection("pot_drafts").document(draft_id).delete()
+        try:
+            for pot_doc in db.collection("pots").where("draft_id", "==", draft_id).stream():
+                pot_doc.reference.delete()
+        except Exception as e:
+            log.warning("cancel_create_cleanup_error", extra={"error": str(e)})
+
+    try:
+        for pot_doc in db.collection("pots").where("stripe_session_id", "==", session_id).stream():
+            pot_doc.reference.delete()
+    except Exception as e:
+        log.warning("cancel_create_session_cleanup_error", extra={"error": str(e)})
+
+    map_ref.delete()
+    return RedirectResponse(next, status_code=302)
+
+# ---------- Join-a-Pot ----------
+class JoinPayload(BaseModel):
+    pot_id: str
+    entry_id: str
+    amount_cents: int
+    success_url: str
+    cancel_url: str
+    player_name: Optional[str] = "Player"
+    player_email: Optional[str] = None
+
 @app.post("/create-checkout-session")
-def create_checkout_session(body: JoinPotRequest):
-    if not stripe or not STRIPE_SECRET_KEY:
-        raise HTTPException(500, "Stripe not configured")
-    pot_id = (body.pot_id or "").strip()
-    if not pot_id:
-        raise HTTPException(400, "Missing pot_id")
+async def create_checkout_session(payload: JoinPayload, request: Request):
+    pot_id = payload.pot_id
+    entry_id = payload.entry_id
+    amount_cents = int(payload.amount_cents or 0)
+    success_url = payload.success_url
+    cancel_url = payload.cancel_url
+    player_name = payload.player_name or "Player"
+    player_email = payload.player_email
 
-    # Find the pot (must exist)
-    pot_ref = db.collection("pots").document(pot_id)
-    if not pot_ref.get().exists:
-        raise HTTPException(404, "pot-not-found")
+    if not pot_id or not entry_id:
+        raise HTTPException(400, "Missing pot_id or entry_id")
+    if amount_cents < 50:
+        raise HTTPException(400, "Minimum amount is 50 cents")
+    if not success_url or not cancel_url:
+        raise HTTPException(400, "Missing success/cancel URLs")
 
-    # Price for player buy-in (you can store this on the pot if it varies)
-    player_price_cents = int(os.getenv("PLAYER_BUYIN_CENT", "1500") or "1500")
-    currency = "usd"
-
-    try:
-        session = stripe.checkout.Session.create(
-            mode="payment",
-            payment_method_types=["card"],
-            line_items=[{
-                "price_data": {
-                    "currency": currency,
-                    "product_data": {"name": f"Join Pot {pot_id}"},
-                    "unit_amount": player_price_cents,
-                },
-                "quantity": 1,
-            }],
-            success_url=f"{FRONTEND_BASE_URL}/success.html?session_id={{CHECKOUT_SESSION_ID}}",
-            cancel_url=f"{FRONTEND_BASE_URL}/cancel.html",
-            metadata={
-                "type": "join",
-                "pot_id": pot_id,
-                "player_name": body.player_name or "",
-                "player_email": body.player_email or "",
+    session = stripe.checkout.Session.create(
+        mode="payment",
+        line_items=[{
+            "price_data": {
+                "currency": "usd",
+                "product_data": {"name": f"Join Pot — {player_name}"},
+                "unit_amount": amount_cents,
             },
-        )
-        return {"id": session.get("id")}
-    except Exception as e:
-        raise HTTPException(500, f"stripe-error: {e}")
+            "quantity": 1,
+        }],
+        customer_email=player_email,
+        success_url=f"{success_url}?flow=join&session_id={{CHECKOUT_SESSION_ID}}&pot_id={pot_id}&entry_id={entry_id}",
+        cancel_url=f"{server_base(request)}/cancel-join?session_id={{CHECKOUT_SESSION_ID}}&pot_id={pot_id}&entry_id={entry_id}&next={quote(cancel_url)}",
+        metadata={"flow": "join", "pot_id": pot_id, "entry_id": entry_id, "player_email": player_email or "", "player_name": player_name or ""},
+    )
 
-# ---- Webhook ----
-STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
+    db.collection("join_sessions").document(session["id"]).set({"pot_id": pot_id,"entry_id": entry_id,"createdAt": utcnow()})
+    return {"url": session.url, "session_id": session["id"]}
 
-@app.post("/webhook")
-def webhook(payload: Dict[str, Any] = Body(...), stripe_signature: Optional[str] = Query(None)):
-    """Stripe webhook for checkout.session.completed"""
-    if not stripe:
-        # Allow local testing without Stripe
-        return {"ok": True}
-
-    # Render forwards JSON → we already have dict payload
-    event = payload
-    try:
-        # If you want signature verification, uncomment and adapt:
-        # sig = request.headers.get("Stripe-Signature")
-        # event = stripe.Webhook.construct_event(request_body, sig, STRIPE_WEBHOOK_SECRET)
-        pass
-    except Exception as e:
-        raise HTTPException(400, f"Webhook error: {e}")
-
-    if event.get("type") == "checkout.session.completed":
-        data = event.get("data", {}).get("object", {})
-        metadata = data.get("metadata", {}) or {}
-        sess_id = data.get("id")
-        if metadata.get("type") == "create":
-            # Create pots
-            qty = int(str(metadata.get("pot_qty", "1") or "1"))
-            settings_json = metadata.get("settings_json") or ""
-            organizer_email = metadata.get("organizer_email") or ""
-            _create_pots_for_session(sess_id, qty, organizer_email, settings_json)
-        elif metadata.get("type") == "join":
-            pot_id = metadata.get("pot_id") or ""
-            player_name = metadata.get("player_name") or ""
-            player_email = metadata.get("player_email") or ""
-            _record_join_payment(pot_id, player_name, player_email, source="stripe", session_id=sess_id)
-
-    return {"ok": True}
-
-def _create_pots_for_session(session_id: str, qty: int, organizer_email: str, settings_json: str):
-    qty = max(1, min(20, int(qty or 1)))
-    pots: List[str] = []
-    for _ in range(qty):
-        doc = db.collection("pots").document()
-        pot_id = doc.id
-        owner_key = generate_owner_key(pot_id)
-        doc.set({
-            "createdAt": utcnow(),
-            "createdSessionId": session_id,
-            "owner_key": owner_key,
-            "organizer_email": organizer_email,
-            "settings_json": settings_json,
-        }, merge=True)
-        pots.append(pot_id)
-    # store a small "session record" to speed up lookup
-    db.collection("sessions").document(session_id).set({
-        "pots": pots,
-        "createdAt": utcnow()
-    }, merge=True)
-
-def _record_join_payment(pot_id: str, player_name: str, player_email: str, source: str, session_id: Optional[str] = None):
-    if not pot_id:
-        return
-    entry_ref = db.collection("pots").document(pot_id).collection("entries").document()
-    entry_ref.set({
-        "name": (player_name or "").strip(),
-        "email": (player_email or "").strip().lower(),
-        "createdAt": utcnow(),
-        "paid": True,
-        "paid_method": source,
-        "paid_at": utcnow(),
-        "payments": [{
-            "type": "stripe",
-            "amount_cents": int(os.getenv("PLAYER_BUYIN_CENT", "1500") or "1500"),
-            "at": utcnow(),
-            "session_id": session_id or ""
-        }]
-    }, merge=True)
-
-# ---- Success helpers ----
-@app.get("/created-pots")
-def created_pots(session_id: str = Query(...)):
-    # First, check the small session record
-    sess_doc = db.collection("sessions").document(session_id).get()
-    if sess_doc.exists:
-        pots = (sess_doc.to_dict() or {}).get("pots") or []
-        return {"pots": [{"id": p, "owner_key": _try_owner_key(p)} for p in pots]}
-
-    # Fallback: scan for createdSessionId (small dataset expected)
-    pots = db.collection("pots").where("createdSessionId", "==", session_id).stream()
-    out = []
-    for d in pots:
-        pot_id = d.id
-        out.append({"id": pot_id, "owner_key": _try_owner_key(pot_id)})
-    return {"pots": out}
-
-def _try_owner_key(pot_id: str) -> str:
-    # Return stored key if present; otherwise compute current HMAC
-    snap = db.collection("pots").document(pot_id).get()
+@app.get("/cancel-join")
+def cancel_join(session_id: str, pot_id: Optional[str] = None, entry_id: Optional[str] = None, next: str = "/"):
+    map_ref = db.collection("join_sessions").document(session_id)
+    snap = map_ref.get()
     if snap.exists:
-        pot = snap.to_dict() or {}
-        if pot.get("owner_key"):
-            return pot["owner_key"]
-    if OWNER_TOKEN_SECRET:
-        return generate_owner_key(pot_id)
-    return ""
+        m = snap.to_dict() or {}
+        pot_id = pot_id or m.get("pot_id")
+        entry_id = entry_id or m.get("entry_id")
+        map_ref.delete()
 
-@app.post("/finalize-create")
-def finalize_create(session_id: str = Query(...)):
-    """If webhook didn't create pots, this will (idempotent)."""
-    if not stripe or not STRIPE_SECRET_KEY:
-        # Without stripe, we cannot inspect the session, so create one pot as fallback
-        _create_pots_for_session(session_id, 1, "", "")
-        return {"ok": True}
+    if pot_id and entry_id:
+        entry_ref = db.collection("pots").document(pot_id).collection("entries").document(entry_id)
+        es = entry_ref.get()
+        if es.exists:
+            entry = es.to_dict() or {}
+            if not entry.get("paid"):
+                entry_ref.delete()
+    return RedirectResponse(next, status_code=302)
 
+# ---------- Subscriptions (optional) ----------
+ACTIVE = {"active","trialing","past_due"}
+
+class SubCreate(BaseModel):
+    price_id: str
+    success_url: str
+    cancel_url: str
+    email: Optional[str] = None
+
+@app.post("/create-organizer-subscription")
+async def create_organizer_subscription(payload: SubCreate):
+    price_id = (payload.price_id or "").strip()
+    success_url = payload.success_url
+    cancel_url = payload.cancel_url
+    email = (payload.email or "").strip() or None
+
+    if not (price_id and success_url and cancel_url):
+        raise HTTPException(400, "Missing price_id/success_url/cancel_url")
+    if price_id not in ALLOWED_PRICE_IDS:
+        raise HTTPException(400, "Invalid price_id")
+
+    session = stripe.checkout.Session.create(
+        mode="subscription",
+        payment_method_types=["card"],
+        line_items=[{"price": price_id, "quantity": 1}],
+        success_url=success_url,
+        cancel_url=cancel_url,
+        customer_email=email,
+        allow_promotion_codes=True,
+    )
+    return {"url": session.url}
+
+def _extract_plan(sub: Dict[str,Any]) -> Dict[str,Any]:
+    items = (sub.get("items",{}) or {}).get("data") or []
+    first = items[0] if items else {}
+    price = (first or {}).get("price") or {}
+    recurring = price.get("recurring") or {}
+    price_id = price.get("id")
+    bits = PLAN_CONFIG.get(price_id, {})
+    return {
+        "price_id": price_id,
+        "interval": recurring.get("interval") or bits.get("interval"),
+        "amount_cents": price.get("unit_amount"),
+        "currency": price.get("currency"),
+        "plan": bits.get("plan"),
+        "pots_per_month": bits.get("pots_per_month"),
+        "max_users_per_event": bits.get("max_users_per_event"),
+    }
+
+def _write_email(email_lc: str, cust_id: str, sub: Dict[str,Any]):
+    doc = {
+        "email": email_lc,
+        "status": sub.get("status"),
+        "current_period_end": sub.get("current_period_end"),
+        "stripe_customer_id": sub.get("customer") or cust_id,
+        "stripe_subscription_id": sub.get("id"),
+        "updated_at": firestore.SERVER_TIMESTAMP,
+        **_extract_plan(sub),
+    }
+    db.collection("organizer_subs_emails").document(email_lc).set(doc, merge=True)
+
+# ---------- Owner auth + rotate/revoke ----------
+class OwnerAuth(BaseModel):
+    key: Optional[str] = None
+    code: Optional[str] = None
+
+def _require_owner(pot_id: str, auth: OwnerAuth):
+    if auth.key and verify_owner_token(pot_id, auth.key):
+        return True
+    if auth.code:
+        snap = db.collection("pots").document(pot_id).get()
+        if not snap.exists: 
+            raise HTTPException(404, "Pot not found")
+        if hash_code(auth.code) == (snap.to_dict() or {}).get("owner_code_hash"):
+            return True
+    raise HTTPException(401, "Invalid owner credentials")
+
+@app.post("/pots/{pot_id}/owner/auth")
+def owner_auth(pot_id: str, body: OwnerAuth):
+    _require_owner(pot_id, body)
+    return {"ok": True, "owner": True}
+
+@app.post("/pots/{pot_id}/owner/rotate-code")
+def owner_rotate_code(pot_id: str, body: OwnerAuth):
+    _require_owner(pot_id, body)
+    code = random_owner_code()
+    db.collection("pots").document(pot_id).set({
+        "owner_code_hash": hash_code(code),
+        "owner_code_rotated_at": firestore.SERVER_TIMESTAMP,
+    }, merge=True)
+    return {"ok": True, "new_code": code}
+
+@app.post("/pots/{pot_id}/owner/rotate-link")
+def owner_rotate_link(pot_id: str, body: OwnerAuth):
+    _require_owner(pot_id, body)
+    new_salt = b64url_encode(secrets.token_bytes(12))
+    db.collection("pots").document(pot_id).set({
+        "owner_token_salt": new_salt,
+        "owner_token_rotated_at": firestore.SERVER_TIMESTAMP,
+    }, merge=True)
+    token = make_owner_token(pot_id)
+    manage_url = f"{FRONTEND_BASE_URL}/manage?pot={pot_id}&key={token}"
+    db.collection("owner_links").document(pot_id).set({
+        "manage_url": manage_url,
+        "rotatedAt": firestore.SERVER_TIMESTAMP,
+    }, merge=True)
+    return {"ok": True, "manage_url": manage_url}
+
+@app.post("/pots/{pot_id}/owner/revoke-all")
+def owner_revoke_all(pot_id: str, body: OwnerAuth):
+    _require_owner(pot_id, body)
+    code = random_owner_code()
+    new_salt = b64url_encode(secrets.token_bytes(12))
+    db.collection("pots").document(pot_id).set({
+        "owner_code_hash": hash_code(code),
+        "owner_code_rotated_at": firestore.SERVER_TIMESTAMP,
+        "owner_token_salt": new_salt,
+        "owner_token_rotated_at": firestore.SERVER_TIMESTAMP,
+    }, merge=True)
+    token = make_owner_token(pot_id)
+    manage_url = f"{FRONTEND_BASE_URL}/manage?pot={pot_id}&key={token}"
+    db.collection("owner_links").document(pot_id).set({
+        "manage_url": manage_url,
+        "rotatedAt": firestore.SERVER_TIMESTAMP,
+    }, merge=True)
+    return {"ok": True, "new_code": code, "manage_url": manage_url}
+
+# ---------- Stripe webhook ----------
+@app.post("/webhook")
+async def webhook(request: Request):
+    payload = await request.body()
+    sig = request.headers.get("stripe-signature")
     try:
-        sess = stripe.checkout.Session.retrieve(session_id)
-        meta = sess.get("metadata", {}) or {}
-        qty = int(str(meta.get("pot_qty", "1") or "1"))
-        organizer_email = meta.get("organizer_email") or ""
-        settings_json = meta.get("settings_json") or ""
-        # Only create if none exist yet
-        existing = db.collection("pots").where("createdSessionId", "==", session_id).stream()
-        if not any(True for _ in existing):
-            _create_pots_for_session(session_id, qty, organizer_email, settings_json)
-        return {"ok": True}
+        event = stripe.Webhook.construct_event(payload, sig, WEBHOOK_SECRET)
     except Exception as e:
-        raise HTTPException(500, f"finalize-error: {e}")
+        log.error("webhook_bad_signature", extra={"error": str(e)})
+        raise HTTPException(400, str(e))
 
-# ---- Owner utilities (entries) ----
-@app.get("/pots/{pot_id}/entries")
-def list_entries(pot_id: str, key: str = Query(...)):
-    if not verify_owner_token(pot_id, key):
-        raise HTTPException(status_code=401, detail="Invalid owner key")
-    docs = db.collection("pots").document(pot_id).collection("entries").stream()
-    entries = []
-    for d in docs:
-        data = d.to_dict() or {}
-        entries.append({
-            "id": d.id,
-            "name": data.get("name") or data.get("player") or "",
-            "email": data.get("email") or "",
-            "paid": bool(data.get("paid")),
-        })
-    return {"entries": entries}
+    etype = event.get("type")
+    obj = event.get("data",{}).get("object",{})
+    log.info("webhook_event_received", extra={"type": etype})
 
-@app.post("/pots/{pot_id}/entries/add-manual")
-def add_manual_entry(pot_id: str, key: str = Query(...), body: ManualEntryIn = Body(...)):
-    if not verify_owner_token(pot_id, key):
-        raise HTTPException(status_code=401, detail="Invalid owner key")
-    entry_ref = db.collection("pots").document(pot_id).collection("entries").document()
-    entry_ref.set({
-        "name": (body.name or "").strip(),
-        "email": (body.email or "").strip().lower(),
-        "createdAt": utcnow(),
-        "paid": False,
-        "payments": [],
-    }, merge=True)
-    return {"ok": True, "id": entry_ref.id}
+    if etype == "checkout.session.completed":
+        session = obj
+        flow = (session.get("metadata") or {}).get("flow")
 
-@app.post("/pots/{pot_id}/owner-add-entry")
-def owner_add_entry(pot_id: str, key: str = Query(...), body: ManualEntryIn = Body(...)):
-    # alias for compatibility
-    return add_manual_entry(pot_id, key, body)
+        if flow == "create":
+            draft_id = (session.get("metadata") or {}).get("draft_id")
+            count = int((session.get("metadata") or {}).get("count", "1"))
+            if draft_id:
+                draft_ref = db.collection("pot_drafts").document(draft_id)
+                draft_snap = draft_ref.get()
+                draft = draft_snap.to_dict() if draft_snap.exists else {}
+                for _ in range(max(1, count)):
+                    pot_id = db.collection("pots").document().id
+                    # create initial salt for this pot so future tokens are bound to it
+                    initial_salt = b64url_encode(secrets.token_bytes(12))
+                    code = random_owner_code()
+                    db.collection("pots").document(pot_id).set({
+                        **(draft or {}),
+                        "status": "active",
+                        "createdAt": utcnow(),
+                        "source": "checkout",
+                        "draft_id": draft_id,
+                        "stripe_session_id": session["id"],
+                        "amount_total": session.get("amount_total"),
+                        "currency": session.get("currency", "usd"),
+                        "owner_code_hash": hash_code(code),
+                        "owner_token_salt": initial_salt,
+                    }, merge=True)
+                    # issue magic link using this pot's salt
+                    token = make_owner_token(pot_id)
+                    manage_url = f"{FRONTEND_BASE_URL}/manage?pot={pot_id}&key={token}"
+                    db.collection("owner_links").document(pot_id).set({
+                        "manage_url": manage_url,
+                        "createdAt": firestore.SERVER_TIMESTAMP,
+                    })
+                draft_ref.delete()
+                db.collection("create_sessions").document(session["id"]).delete()
 
-@app.post("/pots/{pot_id}/entries/{entry_id}/mark-paid-manual")
-def mark_paid_manual(pot_id: str, entry_id: str, key: str = Query(...), body: ManualPaymentIn = Body(...)):
-    if not verify_owner_token(pot_id, key):
-        raise HTTPException(status_code=401, detail="Invalid owner key")
-    entry_ref = db.collection("pots").document(pot_id).collection("entries").document(entry_id)
-    if not entry_ref.get().exists:
-        raise HTTPException(404, "entry-not-found")
-    amount = int(body.amount_cents or 0)
-    method = (body.method or "cash").lower()
-    note = (body.note or "")[:120]
-    entry_ref.set({
-        "paid": True,
-        "paid_at": utcnow(),
-        "paid_method": method,
-        "paid_amount_cents": amount,
-        "payments": firestore.ArrayUnion([{
-            "type": "manual",
-            "method": method,
-            "amount_cents": amount,
-            "note": note,
-            "at": utcnow()
-        }])
-    }, merge=True)
-    return {"ok": True}
+        elif flow == "join":
+            pot_id = (session.get("metadata") or {}).get("pot_id")
+            entry_id = (session.get("metadata") or {}).get("entry_id")
+            if pot_id and entry_id:
+                entry_ref = db.collection("pots").document(pot_id).collection("entries").document(entry_id)
+                entry_ref.set({
+                    "paid": True,
+                    "paid_amount": session.get("amount_total"),
+                    "paid_at": utcnow(),
+                    "payment_method": "stripe",
+                    "stripe_session_id": session["id"],
+                }, merge=True)
+                db.collection("join_sessions").document(session["id"]).delete()
 
-@app.post("/pots/{pot_id}/entries/{entry_id}/unmark-paid")
-def unmark_paid(pot_id: str, entry_id: str, key: str = Query(...)):
-    if not verify_owner_token(pot_id, key):
-        raise HTTPException(status_code=401, detail="Invalid owner key")
-    entry_ref = db.collection("pots").document(pot_id).collection("entries").document(entry_id)
-    if not entry_ref.get().exists:
-        raise HTTPException(404, "entry-not-found")
-    entry_ref.set({
-        "paid": False,
-        "paid_at": None,
-        "paid_method": None,
-        "paid_amount_cents": None,
-    }, merge=True)
-    return {"ok": True}
+        elif session.get("mode") == "subscription":
+            email = (session.get("customer_details") or {}).get("email") or session.get("customer_email")
+            email_lc = (email or "").lower()
+            sub_id = session.get("subscription")
+            if email_lc and sub_id:
+                sub = stripe.Subscription.retrieve(sub_id)
+                _write_email(email_lc, session.get("customer"), sub)
+
+    elif etype in ("invoice.payment_succeeded","customer.subscription.updated","customer.subscription.deleted","customer.subscription.paused"):
+        if etype.startswith("customer.subscription."):
+            sub = obj; cust_id = sub.get("customer")
+        else:
+            sub_id = obj.get("subscription"); cust_id = obj.get("customer")
+            sub = stripe.Subscription.retrieve(sub_id) if sub_id else None
+        if sub:
+            try:
+                cust = stripe.Customer.retrieve(cust_id) if cust_id else None
+                email = (cust.get("email") if cust else None) or ""
+                email_lc = email.lower() if email else None
+            except Exception:
+                email_lc = None
+            if email_lc:
+                _write_email(email_lc, cust_id, sub)
+
+    return JSONResponse({"received": True})
