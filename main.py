@@ -1,194 +1,275 @@
-# FastAPI backend patch for PicklePot
-# Provides:
-#   - /create-status?session_id=...   -> returns organizer manage info when webhook has finished
-#   - /resolve-owner-code?code=...    -> resolves owner short code to pot_id
-#   - /resolve-owner-code?token=...   -> resolves long owner link token to pot_id
-#   - Stripe webhook /webhook         -> writes create result on checkout.session.completed
-#
-# Firestore is optional: if unavailable, falls back to in-memory stores (good for dev).
-# Env:
-#   STRIPE_SECRET_KEY       (required)
-#   STRIPE_WEBHOOK_SECRET   (recommended for webhook verification)
-#   NETLIFY_SITE            (default: https://picklepotters.netlify.app)
-#   MANAGE_BASE             (default: https://picklepotters.netlify.app/manage.html)
-
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+python
+import os
+import json
+import hmac
+import hashlib
+import base64
+import secrets
+import string
 from typing import Optional, Dict, Any
-from datetime import datetime, timezone
-import os, hmac, hashlib, json
 
-# ---- Optional Firestore ----
-db = None
-try:
-    from google.cloud import firestore
-    db = firestore.Client()  # requires GOOGLE_APPLICATION_CREDENTIALS or ADC on Render
-except Exception:
-    db = None
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+import uvicorn
 
-# ---- Stripe ----
+# ---------- Optional: Firestore storage (fallbacks to in-memory) ----------
+class MemoryStore:
+   def __init__(self):
+       self.sessions: Dict[str, Dict[str, Any]] = {}
+       self.pots: Dict[str, Dict[str, Any]] = {}
+
+   def save_session(self, sid: str, data: Dict[str, Any]):
+       self.sessions[sid] = data
+
+   def get_session(self, sid: str) -> Optional[Dict[str, Any]]:
+       return self.sessions.get(sid)
+
+   def save_pot(self, pot_id: str, data: Dict[str, Any]):
+       self.pots[pot_id] = data
+
+   def get_pot(self, pot_id: str) -> Optional[Dict[str, Any]]:
+       return self.pots.get(pot_id)
+
+
+STORE = MemoryStore()
+
+# ---------- Email (optional) ----------
+import smtplib
+from email.message import EmailMessage
+
+SMTP_HOST = os.getenv("SMTP_HOST")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASS = os.getenv("SMTP_PASS")
+SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER or "noreply@example.com")
+
+def maybe_send_email(to_email: Optional[str], subject: str, html: str):
+   """Send an email if SMTP env vars are configured; otherwise skip."""
+   if not to_email:
+       return
+   if not (SMTP_HOST and SMTP_USER and SMTP_PASS):
+       # No email configuration; silently skip.
+       return
+   msg = EmailMessage()
+   msg["From"] = SMTP_FROM
+   msg["To"] = to_email
+   msg["Subject"] = subject
+   msg.set_content("HTML email required")
+   msg.add_alternative(html, subtype="html")
+   with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
+       s.starttls()
+       s.login(SMTP_USER, SMTP_PASS)
+       s.send_message(msg)
+
+# ---------- Stripe ----------
 import stripe
-stripe.api_key = os.environ.get("STRIPE_SECRET_KEY", "")
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
+if STRIPE_SECRET_KEY:
+   stripe.api_key = STRIPE_SECRET_KEY
 
-WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
-NETLIFY_SITE = os.environ.get("NETLIFY_SITE", "https://picklepotters.netlify.app")
-MANAGE_BASE = os.environ.get("MANAGE_BASE", f"{NETLIFY_SITE.rstrip('/')}/manage.html")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 
-def utcnow_iso():
-    return datetime.now(timezone.utc).isoformat()
+# ---------- App ----------
+app = FastAPI(title="PicklePot Backend")
 
-# In-memory fallback stores
-_mem_create_results: Dict[str, Dict[str, Any]] = {}   # session_id -> result doc
-_mem_owner_keys: Dict[str, str] = {}                  # code/token -> pot_id
+frontend_origin = os.getenv("FRONTEND_ORIGIN", "https://picklepotters.netlify.app")
+allowed = [frontend_origin, "http://localhost", "http://localhost:5173", "http://127.0.0.1:5173", "*"]
 
-def _fs_set(doc_path: str, data: Dict[str, Any]):
-    """doc_path like 'create_results/{id}'"""
-    if db:
-        parts = doc_path.split('/')
-        col = db.collection(parts[0])
-        doc = col.document(parts[1])
-        doc.set(data, merge=True)
-    else:
-        head, _, key = doc_path.partition('/')
-        if head == 'create_results':
-            _mem_create_results[key] = data
-        elif head == 'owner_keys':
-            _mem_owner_keys[key] = data.get('pot_id', '')
-
-def _fs_get(doc_path: str) -> Optional[Dict[str, Any]]:
-    if db:
-        parts = doc_path.split('/')
-        snap = db.collection(parts[0]).document(parts[1]).get()
-        return snap.to_dict() if snap.exists else None
-    else:
-        head, _, key = doc_path.partition('/')
-        if head == 'create_results':
-            return _mem_create_results.get(key)
-        elif head == 'owner_keys':
-            pid = _mem_owner_keys.get(key)
-            return {'pot_id': pid} if pid else None
-        return None
-
-app = FastAPI(title="PicklePot Backend Patch")
-
-# CORS (allow Netlify app + localhost dev)
-allowed_origins = [
-    NETLIFY_SITE,
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-]
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+   CORSMiddleware,
+   allow_origins=allowed,
+   allow_credentials=True,
+   allow_methods=["*"],
+   allow_headers=["*"],
 )
 
-class StatusResponse(BaseModel):
-    ready: bool
-    results: Optional[list] = None
-
-@app.get("/create-status", response_model=StatusResponse)
-async def create_status(session_id: str):
-    doc = _fs_get(f"create_results/{session_id}")
-    if not doc:
-        # not ready yet
-        return StatusResponse(ready=False)
-    # Return compact payload the success page expects
-    return StatusResponse(
-        ready=True,
-        results=[{
-            "pot_id": doc.get("pot_id"),
-            "owner_code": doc.get("owner_code"),
-            "owner_token": doc.get("owner_token"),
-            "manage_url": doc.get("manage_url"),
-            "created_at": doc.get("created_at"),
-        }]
-    )
-
-@app.get("/resolve-owner-code")
-async def resolve_owner_code(code: Optional[str] = None, token: Optional[str] = None):
-    # Either a short owner code OR a long token
-    key = code or token
-    if not key:
-        raise HTTPException(status_code=400, detail="Provide code or token")
-    kdoc = _fs_get(f"owner_keys/{key}")
-    if not kdoc or not kdoc.get("pot_id"):
-        raise HTTPException(status_code=404, detail="Unknown code/token")
-    return {"pot_id": kdoc["pot_id"]}
-
 @app.get("/health")
-async def health():
-    return {"ok": True, "time": utcnow_iso()}
+def health():
+   return {"ok": True}
 
-def _make_owner_code(pot_id: str) -> str:
-    # 5-char base36 code derived from pot_id
-    h = hashlib.sha256(pot_id.encode()).hexdigest()
-    num = int(h[:8], 16)
-    alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    out = []
-    for _ in range(5):
-        out.append(alphabet[num % 36])
-        num //= 36
-    return "".join(out)
+# ---------- Models ----------
+class CreatePotPayload(BaseModel):
+   success_url: str
+   cancel_url: str
+   amount_cents: int = Field(..., ge=50)
+   count: int = Field(1, ge=1, le=16)
+   organizer_name: Optional[str] = None
+   organizer_email: Optional[str] = None
+   tournament_name: Optional[str] = None
+   skill_level: Optional[str] = None
+   location: Optional[str] = None
+   date: Optional[str] = None
+   time: Optional[str] = None
 
-def _calc_token(pot_id: str, session_id: str) -> str:
-    secret = (WEBHOOK_SECRET or os.environ.get("STRIPE_SECRET_KEY","")).encode()
-    raw = f"{pot_id}:{session_id}".encode()
-    return hashlib.sha256(secret + raw).hexdigest()
+class JoinPayload(BaseModel):
+   pot_id: str
+   entry_id: str
+   amount_cents: int
+   success_url: str
+   cancel_url: str
+   player_name: Optional[str] = None
+   player_email: Optional[str] = None
 
-def _compose_manage_url(pot_id: str, owner_token: str) -> str:
-    # /manage.html?pot=...&key=...
-    return f"{MANAGE_BASE}?pot={pot_id}&key={owner_token}"
+def _rand_code(n=5) -> str:
+   return "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(n))
+
+# ---------- Endpoints ----------
+@app.post("/create-pot-session")
+def create_pot_session(payload: CreatePotPayload, request: Request):
+   if not STRIPE_SECRET_KEY:
+       raise HTTPException(status_code=500, detail="Stripe not configured")
+
+   # Create a draft record tied to this checkout session that we can fulfill in webhook
+   draft_id = "draft_" + _rand_code(8)
+
+   # A basic product/price on the fly
+   price_data = {
+       "currency": "usd",
+       "unit_amount": payload.amount_cents,
+       "product_data": {
+           "name": payload.tournament_name or "PicklePot — Create Tournament",
+           "description": f"Create tournament ({payload.count} pot{'s' if payload.count>1 else ''})",
+       },
+   }
+   metadata = {
+       "type": "create_pot",
+       "draft_id": draft_id,
+       "count": str(payload.count),
+       "organizer_name": payload.organizer_name or "",
+       "organizer_email": payload.organizer_email or "",
+       "tournament_name": payload.tournament_name or "",
+       "skill_level": payload.skill_level or "",
+       "location": payload.location or "",
+       "date": payload.date or "",
+       "time": payload.time or "",
+   }
+   session = stripe.checkout.Session.create(
+       mode="payment",
+       line_items=[{"price_data": price_data, "quantity": 1}],
+       success_url=payload.success_url + "?flow=create&session_id={CHECKOUT_SESSION_ID}",
+       cancel_url=payload.cancel_url,
+       metadata=metadata,
+   )
+
+   # Store the draft so /create-status can poll even before webhook arrives
+   STORE.save_session(session.id, {
+       "status": "pending",
+       "draft_id": draft_id,
+       "metadata": metadata,
+       "organizer_email": payload.organizer_email or "",
+   })
+   return {"sessionId": session.id}
+
+@app.post("/create-checkout-session")
+def create_checkout_session(payload: JoinPayload):
+   if not STRIPE_SECRET_KEY:
+       raise HTTPException(status_code=500, detail="Stripe not configured")
+
+   metadata = {
+       "type": "join_pot",
+       "pot_id": payload.pot_id,
+       "entry_id": payload.entry_id,
+       "player_name": payload.player_name or "",
+       "player_email": payload.player_email or "",
+   }
+   price_data = {
+       "currency": "usd",
+       "unit_amount": payload.amount_cents,
+       "product_data": {"name": f"Join Pot {payload.pot_id}"},
+   }
+   session = stripe.checkout.Session.create(
+       mode="payment",
+       line_items=[{"price_data": price_data, "quantity": 1}],
+       success_url=payload.success_url + "?flow=join&session_id={CHECKOUT_SESSION_ID}",
+       cancel_url=payload.cancel_url,
+       metadata=metadata,
+   )
+   return {"sessionId": session.id}
+
+@app.get("/create-status")
+def create_status(session_id: str):
+   rec = STORE.get_session(session_id)
+   if not rec:
+       # Could be after server restart; try Stripe lookup for status
+       try:
+           sess = stripe.checkout.Session.retrieve(session_id)
+           if sess and sess.get("payment_status") == "paid":
+               # Not found in memory; treat as pending fulfill
+               return {"status": "processing"}
+       except Exception:
+           pass
+       raise HTTPException(status_code=404, detail="Unknown session")
+
+   out = {"status": rec["status"]}
+   if rec["status"] == "ready":
+       out.update({
+           "pot_id": rec["pot_id"],
+           "owner_code": rec["owner_code"],
+           "manage_link": rec["manage_link"],
+           "count": rec.get("count", 1),
+       })
+   return out
+
+from fastapi import Header
 
 @app.post("/webhook")
 async def stripe_webhook(request: Request):
-    payload = await request.body()
-    sig_header = request.headers.get("Stripe-Signature")
-    event = None
-    if WEBHOOK_SECRET:
-        try:
-            event = stripe.Webhook.construct_event(
-                payload=payload, sig_header=sig_header, secret=WEBHOOK_SECRET
-            )
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Webhook signature error: {e}")
-    else:
-        # No verification (dev)
-        try:
-            event = json.loads(payload.decode("utf-8"))
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Invalid payload: {e}")
+   payload = await request.body()
+   sig = request.headers.get("stripe-signature")
+   event = None
+   try:
+       if STRIPE_WEBHOOK_SECRET:
+           event = stripe.Webhook.construct_event(
+               payload=payload, sig_header=sig, secret=STRIPE_WEBHOOK_SECRET
+           )
+       else:
+           event = json.loads(payload)
+   except Exception as e:
+       raise HTTPException(status_code=400, detail=str(e))
 
-    if event["type"] == "checkout.session.completed":
-        session = event["data"]["object"]
-        session_id = session.get("id")
-        # You can derive a pot_id deterministically or from metadata.
-        # If your create flow passes metadata, prefer it. Fallback to deterministic id.
-        pot_id = (session.get("metadata") or {}).get("pot_id")
-        if not pot_id:
-            # Deterministic pot id from session + email
-            email = (session.get("customer_details") or {}).get("email", "")
-            pot_id = ("pot_" + hashlib.sha1(f"{session_id}:{email}".encode()).hexdigest()[:8]).lower()
+   if event["type"] == "checkout.session.completed":
+       session = event["data"]["object"]
+       sid = session["id"]
+       meta = session.get("metadata") or {}
+       if meta.get("type") == "create_pot":
+           # Fulfill: make a pot id + owner code + manage link
+           pot_id = "pot_" + _rand_code(6)
+           owner_code = _rand_code(5)
+           count = int(meta.get("count", "1") or "1")
+           manage_link = f"{frontend_origin.rstrip('/')}/manage.html?pot={pot_id}&key={owner_code}"
 
-        owner_code = _make_owner_code(pot_id)
-        owner_token = _calc_token(pot_id, session_id)
-        manage_url = _compose_manage_url(pot_id, owner_token)
+           STORE.save_pot(pot_id, {
+               "owner_code": owner_code,
+               "count": count,
+               "organizer_email": meta.get("organizer_email") or "",
+               "tournament_name": meta.get("tournament_name") or "",
+           })
+           # mark session ready
+           rec = STORE.get_session(sid) or {}
+           rec.update({
+               "status": "ready",
+               "pot_id": pot_id,
+               "owner_code": owner_code,
+               "manage_link": manage_link,
+               "count": count,
+           })
+           STORE.save_session(sid, rec)
 
-        # Persist for success page polling
-        _fs_set(f"create_results/{session_id}", {
-            "pot_id": pot_id,
-            "owner_code": owner_code,
-            "owner_token": owner_token,
-            "manage_url": manage_url,
-            "created_at": utcnow_iso(),
-        })
-        # Map code and token -> pot_id for manager resolution
-        _fs_set(f"owner_keys/{owner_code}", {"pot_id": pot_id, "created_at": utcnow_iso()})
-        _fs_set(f"owner_keys/{owner_token}", {"pot_id": pot_id, "created_at": utcnow_iso()})
+           # Email the organizer if provided
+           to_email = meta.get("organizer_email")
+           if to_email:
+               html = f"""
+               <h2>Your PicklePot is ready</h2>
+               <p><strong>Pot ID:</strong> {pot_id}</p>
+               <p><strong>Owner Code:</strong> {owner_code}</p>
+               <p><a href="{manage_link}">Open Organizer Manage Page</a></p>
+               """
+               maybe_send_email(to_email, "Your PicklePot — Organizer Access", html)
 
-    return {"received": True}
+   return {"received": True}
+
+
+if __name__ == "__main__":
+   port = int(os.getenv("PORT", "10000"))
+   uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
