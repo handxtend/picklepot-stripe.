@@ -27,7 +27,20 @@ WEBHOOK_SECRET = os.environ["STRIPE_WEBHOOK_SECRET"]
 OWNER_TOKEN_SECRET = os.getenv("OWNER_TOKEN_SECRET", "CHANGE-ME")  # set strong value
 FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "https://picklepotters.netlify.app")
 POT_CREATE_PRICE_CENT = int(os.getenv("POT_CREATE_PRICE_CENT", "1000"))
-CORS_ALLOW = os.getenv("CORS_ALLOW") or os.getenv("CORS_ORIGINS") or "*"
+
+# ── CORS (explicit origins; avoid '*' with credentials) ──────────────────────────
+CORS_ALLOW_STR = os.getenv("CORS_ALLOW") or os.getenv("CORS_ORIGINS") or ""
+DEFAULT_ORIGINS = [
+    "https://picklepotters.netlify.app",  # your frontend
+    "http://localhost:8080",              # local testing
+]
+if not CORS_ALLOW_STR.strip():
+    ALLOWED_ORIGINS = DEFAULT_ORIGINS
+elif CORS_ALLOW_STR.strip() == "*":
+    # Do not use '*' with allow_credentials=True; default safely to known origins
+    ALLOWED_ORIGINS = DEFAULT_ORIGINS
+else:
+    ALLOWED_ORIGINS = [o.strip() for o in CORS_ALLOW_STR.split(",") if o.strip()]
 
 # Optional subscription price IDs
 IND_M = os.getenv("STRIPE_PRICE_ID_INDIVIDUAL_MONTHLY", "")
@@ -107,9 +120,9 @@ def verify_owner_token(pot_id: str, token: str) -> bool:
 app = FastAPI(title="PicklePot Backend — Multi-Pot + Owner Links (Rotate/Revoke)")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"] if (CORS_ALLOW == "*" or not CORS_ALLOW) else [o.strip() for o in CORS_ALLOW.split(",") if o.strip()],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["POST", "GET", "OPTIONS"],
     allow_headers=["*"],
 )
 
