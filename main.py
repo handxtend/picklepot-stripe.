@@ -21,7 +21,23 @@ log = logging.getLogger("picklepot-fastapi")
 stripe.api_key = os.environ["STRIPE_SECRET_KEY"]
 WEBHOOK_SECRET = os.environ["STRIPE_WEBHOOK_SECRET"]
 OWNER_TOKEN_SECRET = os.getenv("OWNER_TOKEN_SECRET", "CHANGE-ME")
+
+# Your site root; keep this as your Netlify origin
 FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "https://picklepotters.netlify.app")
+
+# IMPORTANT: point to the actual deployed paths (you can override via Render env)
+PUBLIC_SUCCESS_URL = os.getenv(
+    "PUBLIC_SUCCESS_URL",
+    f"{FRONTEND_BASE_URL}/picklepotters/success.html",  # your deploy shows files under /picklepotters
+)
+PUBLIC_CANCEL_URL = os.getenv(
+    "PUBLIC_CANCEL_URL",
+    f"{FRONTEND_BASE_URL}/picklepotters/cancel.html",
+)
+
+# Where the organizer manage page lives (extensionless in your deploy)
+FRONTEND_MANAGE_PATH = os.getenv("FRONTEND_MANAGE_PATH", "/picklepotters/manage")
+
 POT_CREATE_PRICE_CENT = int(os.getenv("POT_CREATE_PRICE_CENT", "1000"))
 
 # CORS
@@ -34,7 +50,7 @@ elif CORS_ALLOW_STR.strip() == "*":
 else:
     ALLOWED_ORIGINS = [o.strip() for o in CORS_ALLOW_STR.split(",") if o.strip()]
 
-# Optional subscription price ids (existing config)
+# Optional subscription price ids
 IND_M = os.getenv("STRIPE_PRICE_ID_INDIVIDUAL_MONTHLY", "")
 IND_Y = os.getenv("STRIPE_PRICE_ID_INDIVIDUAL_YEARLY", "")
 CLB_M = os.getenv("STRIPE_PRICE_ID_CLUB_MONTHLY", "")
@@ -77,10 +93,11 @@ def _pot_token_salt(pot_id: str) -> str:
     return (data or {}).get("owner_token_salt", "")
 
 def make_owner_token(pot_id: str) -> str:
-    ts = int(time.time())
+    import hashlib as _hashlib, hmac as _hmac, time as _time
+    ts = int(_time.time())
     payload = f"{pot_id}.{ts}"
     key = (OWNER_TOKEN_SECRET + "|" + _pot_token_salt(pot_id)).encode()
-    mac = hmac.new(key, payload.encode(), hashlib.sha256).digest()[:16]
+    mac = _hmac.new(key, payload.encode(), _hashlib.sha256).digest()[:16]
     return f"{b64url_encode(payload.encode())}.{b64url_encode(mac)}"
 
 # ------------------- Optional SMTP Email -------------------
@@ -95,10 +112,6 @@ SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER or "")
 FROM_NAME  = os.getenv("FROM_NAME", "Pickle Pot")
 
 def send_email_smtp(to_email: str, subject: str, html: str):
-    """
-    Sends email via a standard SMTP mailbox (no external API service required).
-    If SMTP env vars are not set, the function no-ops gracefully.
-    """
     if not (SMTP_HOST and SMTP_USER and SMTP_PASS and SMTP_FROM and to_email):
         log.info("SMTP not configured or recipient missing; skipping email.")
         return
@@ -125,7 +138,7 @@ def email_organizer_links(organizer_email: str, pots: list[dict]):
     <p>Hi! Your tournament has been created.</p>
     <p>Use the links/codes below to manage your pot(s):</p>
     <ul>{items}</ul>
-    <p>Organizer page (bookmark): <a href="{FRONTEND_BASE_URL}/manage.html">Manage Pot</a></p>
+    <p>Organizer page (bookmark): <a href="{FRONTEND_BASE_URL}{FRONTEND_MANAGE_PATH}">Manage Pot</a></p>
     """
     try:
         send_email_smtp(organizer_email, "Your Pickle Pot — Organizer Links", html)
@@ -153,23 +166,27 @@ def health():
 # ------------------- Create Pot Session -------------------
 class CreatePotPayload(BaseModel):
     draft: Dict[str, Any] | None = None
-    success_url: str
-    cancel_url: str
+    success_url: Optional[str] = None   # kept for compatibility, but we override
+    cancel_url: Optional[str] = None    # kept for compatibility, but we override
     amount_cents: Optional[int] = None
     count: Optional[int] = 1
 
 @app.post("/create-pot-session")
 async def create_pot_session(payload: CreatePotPayload, request: Request):
     draft = payload.draft or {}
-    success_url = payload.success_url
-    cancel_url  = payload.cancel_url
     amount_cents = int(payload.amount_cents or POT_CREATE_PRICE_CENT)
     count = max(1, int(payload.count or 1))
-    if not success_url or not cancel_url: raise HTTPException(400, "Missing success/cancel URLs")
-    if amount_cents < 50: raise HTTPException(400, "Minimum amount is 50 cents")
+    if amount_cents < 50:
+        raise HTTPException(400, "Minimum amount is 50 cents")
 
-    # Try to capture an organizer email from the draft (multiple key variants supported)
+    # Always use the server-configured success/cancel URLs so they match your deployed paths
+    success_url = PUBLIC_SUCCESS_URL
+    cancel_url = PUBLIC_CANCEL_URL
+
+    # Organizer email (various field names supported)
     org_email = (draft.get("organizer_email") or draft.get("organizerEmail") or draft.get("org_email") or "").strip()
+
+    log.info("[CREATE] Using success_url=%s  cancel_url=%s  count=%s", success_url, cancel_url, count)
 
     draft_ref = db.collection("pot_drafts").document()
     draft_ref.set({**draft, "status":"draft", "createdAt": utcnow()}, merge=True)
@@ -184,8 +201,9 @@ async def create_pot_session(payload: CreatePotPayload, request: Request):
             },
             "quantity": count,
         }],
-        # IMPORTANT: include session id in success url so the success page can fetch results
+        # IMPORTANT: include session id so the success page can fetch results
         success_url=f"{success_url}?flow=create&session_id={{CHECKOUT_SESSION_ID}}",
+        # cancel: we can still hop back to your frontend if you like
         cancel_url=f"{server_base(request)}/cancel-create?session_id={{CHECKOUT_SESSION_ID}}&next={quote(cancel_url)}",
         metadata={
             "draft_id": draft_ref.id,
@@ -268,6 +286,8 @@ async def webhook(request: Request):
     if etype == "checkout.session.completed":
         session = obj
         flow = (session.get("metadata") or {}).get("flow")
+        log.info("[WEBHOOK] checkout.session.completed flow=%s session_id=%s", flow, session.get("id"))
+
         if flow == "create":
             draft_id = (session.get("metadata") or {}).get("draft_id")
             count = int((session.get("metadata") or {}).get("count","1"))
@@ -289,15 +309,18 @@ async def webhook(request: Request):
                         "owner_token_salt": salt,
                     }, merge=True)
                     token = make_owner_token(pot_id)
-                    # NOTE: use manage.html to match frontend
-                    manage_url = f"{FRONTEND_BASE_URL}/manage.html?pot={pot_id}&key={token}"
-                    db.collection("owner_links").document(pot_id).set({"manage_url": manage_url, "createdAt": firestore.SERVER_TIMESTAMP}, merge=True)
+                    manage_url = f"{FRONTEND_BASE_URL}{FRONTEND_MANAGE_PATH}?pot={pot_id}&key={token}"
+                    db.collection("owner_links").document(pot_id).set(
+                        {"manage_url": manage_url, "createdAt": firestore.SERVER_TIMESTAMP}, merge=True
+                    )
                     results.append({"pot_id": pot_id, "manage_url": manage_url, "owner_code": code})
-                db.collection("create_results").document(session["id"]).set({"pots": results, "createdAt": firestore.SERVER_TIMESTAMP}, merge=True)
+
+                db.collection("create_results").document(session["id"]).set(
+                    {"pots": results, "createdAt": firestore.SERVER_TIMESTAMP}, merge=True
+                )
                 db.collection("pot_drafts").document(draft_id).delete()
                 db.collection("create_sessions").document(session["id"]).delete()
 
-                # Optional email
                 if organizer_email:
                     email_organizer_links(organizer_email, results)
 
