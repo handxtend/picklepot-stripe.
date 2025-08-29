@@ -3,8 +3,8 @@ from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 from urllib.parse import quote
 
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse, RedirectResponse, Response
+from fastapi import FastAPI, Request, HTTPException, Query
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -12,35 +12,21 @@ import stripe
 import firebase_admin
 from firebase_admin import credentials, firestore
 
-# =========================
-# Logging
-# =========================
+# ------------------ Logging ------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 log = logging.getLogger("picklepot-fastapi")
 
-# =========================
-# Environment
-# =========================
+# ------------------ Env ------------------
 stripe.api_key = os.environ["STRIPE_SECRET_KEY"]
 WEBHOOK_SECRET = os.environ["STRIPE_WEBHOOK_SECRET"]
-OWNER_TOKEN_SECRET = os.getenv("OWNER_TOKEN_SECRET", "CHANGE-ME")  # set strong value
 FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "https://picklepotters.netlify.app")
+OWNER_TOKEN_SECRET = os.getenv("OWNER_TOKEN_SECRET", "CHANGE-ME")  # set strong value
 POT_CREATE_PRICE_CENT = int(os.getenv("POT_CREATE_PRICE_CENT", "1000"))
 CORS_ALLOW = os.getenv("CORS_ALLOW") or os.getenv("CORS_ORIGINS") or "*"
 
-# Optional subscription price IDs
-IND_M = os.getenv("STRIPE_PRICE_ID_INDIVIDUAL_MONTHLY", "")
-IND_Y = os.getenv("STRIPE_PRICE_ID_INDIVIDUAL_YEARLY", "")
-CLB_M = os.getenv("STRIPE_PRICE_ID_CLUB_MONTHLY", "")
-CLB_Y = os.getenv("STRIPE_PRICE_ID_CLUB_YEARLY", "")
-PLAN_CONFIG: Dict[str, Dict[str, Any]] = {
-    IND_M: {"plan":"individual","interval":"month","pots_per_month":2,"max_users_per_event":12},
-    IND_Y: {"plan":"individual","interval":"year","pots_per_month":2,"max_users_per_event":12},
-    CLB_M: {"plan":"club","interval":"month","pots_per_month":10,"max_users_per_event":64},
-    CLB_Y: {"plan":"club","interval":"year","pots_per_month":10,"max_users_per_event":64},
-}
-ALLOWED_PRICE_IDS = [p for p in {IND_M, IND_Y, CLB_M, CLB_Y} if p]
+# Owner code TTL (plaintext exposure on /create-status)
+OWNER_CODE_TTL_SECONDS = int(os.getenv("OWNER_CODE_TTL", "600"))  # 10 minutes default
 
 # Firebase
 cred_json = os.environ["FIREBASE_SERVICE_ACCOUNT_JSON"]
@@ -53,9 +39,7 @@ if not firebase_admin._apps:
         firebase_admin.initialize_app(cred)
 db = firestore.client()
 
-# =========================
-# Helpers
-# =========================
+# ------------------ Helpers ------------------
 def utcnow():
     return datetime.now(timezone.utc)
 
@@ -92,8 +76,7 @@ def verify_owner_token(pot_id: str, token: str) -> bool:
         p_b64, mac_b64 = token.split(".")
         payload = b64url_decode(p_b64).decode()
         pot, ts_s = payload.split(".")
-        if pot != pot_id:
-            return False
+        if pot != pot_id: return False
         mac = b64url_decode(mac_b64)
         key = (OWNER_TOKEN_SECRET + "|" + _pot_token_salt(pot_id)).encode()
         exp = hmac.new(key, payload.encode(), hashlib.sha256).digest()[:16]
@@ -101,29 +84,23 @@ def verify_owner_token(pot_id: str, token: str) -> bool:
     except Exception:
         return False
 
-# =========================
-# FastAPI
-# =========================
-app = FastAPI(title="PicklePot Backend — Multi-Pot + Owner Links (Rotate/Revoke)")
+# ------------------ FastAPI ------------------
+app = FastAPI(title="PicklePot Backend")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"] if (CORS_ALLOW == "*" or not CORS_ALLOW) else [o.strip() for o in CORS_ALLOW.split(",") if o.strip()],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
-# ---------- Health ----------
 @app.get("/", include_in_schema=False)
 def root():
-    return {"ok": True, "service": "picklepot-stripe", "try": ["/health", "/create-pot-session", "/create-checkout-session", "/webhook"]}
+    return {"ok": True}
 
 @app.get("/health")
 def health():
-    log.info("health_check", extra={"price_cents": POT_CREATE_PRICE_CENT})
-    return {"ok": True, "price_cents": POT_CREATE_PRICE_CENT}
+    return {"ok": True, "now": utcnow().isoformat()}
 
-# ---------- Create-a-Pot (multi) ----------
+# ------------------ Create-a-Pot ------------------
 class CreatePotPayload(BaseModel):
     draft: Dict[str, Any] | None = None
     success_url: str
@@ -134,17 +111,15 @@ class CreatePotPayload(BaseModel):
 @app.post("/create-pot-session")
 async def create_pot_session(payload: CreatePotPayload, request: Request):
     draft = payload.draft or {}
-    success_url = payload.success_url
-    cancel_url  = payload.cancel_url
     amount_cents = int(payload.amount_cents or POT_CREATE_PRICE_CENT)
     count = max(1, int(payload.count or 1))
 
-    log.info("create_pot_session_request", extra={"amount_cents": amount_cents, "count": count})
-    if not success_url or not cancel_url:
+    if not payload.success_url or not payload.cancel_url:
         raise HTTPException(400, "Missing success/cancel URLs")
     if amount_cents < 50:
         raise HTTPException(400, "Minimum amount is 50 cents")
 
+    # stash the draft
     draft_ref = db.collection("pot_drafts").document()
     draft_ref.set({**draft, "status": "draft", "createdAt": utcnow()}, merge=True)
 
@@ -153,13 +128,13 @@ async def create_pot_session(payload: CreatePotPayload, request: Request):
         line_items=[{
             "price_data": {
                 "currency": "usd",
-                "product_data": {"name": f"Create Pot — {draft.get('name') or 'Tournament'}"},
+                "product_data": {"name": f"Create Pot — {draft.get('name') or draft.get('tournament_name') or 'Tournament'}"},
                 "unit_amount": amount_cents,
             },
             "quantity": count,
         }],
-        success_url=f"{success_url}?flow=create&session_id={{CHECKOUT_SESSION_ID}}",
-        cancel_url=f"{server_base(request)}/cancel-create?session_id={{CHECKOUT_SESSION_ID}}&next={quote(cancel_url)}",
+        success_url=f"{payload.success_url}?flow=create&session_id={{CHECKOUT_SESSION_ID}}",
+        cancel_url=f"{server_base(request)}/cancel-create?session_id={{CHECKOUT_SESSION_ID}}&next={quote(payload.cancel_url)}",
         metadata={"draft_id": draft_ref.id, "flow": "create", "count": str(count)},
     )
 
@@ -167,7 +142,8 @@ async def create_pot_session(payload: CreatePotPayload, request: Request):
         "draft_id": draft_ref.id,
         "count": count,
         "createdAt": utcnow(),
-    })
+        "ready": False,
+    }, merge=True)
 
     return {"draft_id": draft_ref.id, "url": session.url, "count": count}
 
@@ -176,25 +152,18 @@ def cancel_create(session_id: str, next: str = "/"):
     map_ref = db.collection("create_sessions").document(session_id)
     snap = map_ref.get()
     draft_id = (snap.to_dict() or {}).get("draft_id") if snap.exists else None
-
     if draft_id:
         db.collection("pot_drafts").document(draft_id).delete()
-        try:
-            for pot_doc in db.collection("pots").where("draft_id", "==", draft_id).stream():
-                pot_doc.reference.delete()
-        except Exception as e:
-            log.warning("cancel_create_cleanup_error", extra={"error": str(e)})
-
+    # Remove any pots created under this session (belt and braces)
     try:
         for pot_doc in db.collection("pots").where("stripe_session_id", "==", session_id).stream():
             pot_doc.reference.delete()
     except Exception as e:
         log.warning("cancel_create_session_cleanup_error", extra={"error": str(e)})
-
     map_ref.delete()
     return RedirectResponse(next, status_code=302)
 
-# ---------- Join-a-Pot ----------
+# ------------------ Join-a-Pot ------------------
 class JoinPayload(BaseModel):
     pot_id: str
     entry_id: str
@@ -207,37 +176,28 @@ class JoinPayload(BaseModel):
 @app.post("/create-checkout-session")
 async def create_checkout_session(payload: JoinPayload, request: Request):
     pot_id = payload.pot_id
-    entry_id = payload.entry_id
-    amount_cents = int(payload.amount_cents or 0)
-    success_url = payload.success_url
-    cancel_url = payload.cancel_url
-    player_name = payload.player_name or "Player"
-    player_email = payload.player_email
-
-    if not pot_id or not entry_id:
+    if not pot_id or not payload.entry_id:
         raise HTTPException(400, "Missing pot_id or entry_id")
-    if amount_cents < 50:
+    if payload.amount_cents < 50:
         raise HTTPException(400, "Minimum amount is 50 cents")
-    if not success_url or not cancel_url:
-        raise HTTPException(400, "Missing success/cancel URLs")
 
     session = stripe.checkout.Session.create(
         mode="payment",
         line_items=[{
             "price_data": {
                 "currency": "usd",
-                "product_data": {"name": f"Join Pot — {player_name}"},
-                "unit_amount": amount_cents,
+                "product_data": {"name": f"Join Pot — {payload.player_name or 'Player'}"},
+                "unit_amount": int(payload.amount_cents),
             },
             "quantity": 1,
         }],
-        customer_email=player_email,
-        success_url=f"{success_url}?flow=join&session_id={{CHECKOUT_SESSION_ID}}&pot_id={pot_id}&entry_id={entry_id}",
-        cancel_url=f"{server_base(request)}/cancel-join?session_id={{CHECKOUT_SESSION_ID}}&pot_id={pot_id}&entry_id={entry_id}&next={quote(cancel_url)}",
-        metadata={"flow": "join", "pot_id": pot_id, "entry_id": entry_id, "player_email": player_email or "", "player_name": player_name or ""},
+        customer_email=payload.player_email,
+        success_url=f"{payload.success_url}?flow=join&session_id={{CHECKOUT_SESSION_ID}}&pot_id={pot_id}&entry_id={payload.entry_id}",
+        cancel_url=f"{server_base(request)}/cancel-join?session_id={{CHECKOUT_SESSION_ID}}&pot_id={pot_id}&entry_id={payload.entry_id}&next={quote(payload.cancel_url)}",
+        metadata={"flow": "join", "pot_id": pot_id, "entry_id": payload.entry_id, "player_email": payload.player_email or ""},
     )
 
-    db.collection("join_sessions").document(session["id"]).set({"pot_id": pot_id,"entry_id": entry_id,"createdAt": utcnow()})
+    db.collection("join_sessions").document(session["id"]).set({"pot_id": pot_id,"entry_id": payload.entry_id,"createdAt": utcnow()})
     return {"url": session.url, "session_id": session["id"]}
 
 @app.get("/cancel-join")
@@ -259,87 +219,25 @@ def cancel_join(session_id: str, pot_id: Optional[str] = None, entry_id: Optiona
                 entry_ref.delete()
     return RedirectResponse(next, status_code=302)
 
-# ---------- Subscriptions (optional) ----------
-ACTIVE = {"active","trialing","past_due"}
-
-class SubCreate(BaseModel):
-    price_id: str
-    success_url: str
-    cancel_url: str
-    email: Optional[str] = None
-
-@app.post("/create-organizer-subscription")
-async def create_organizer_subscription(payload: SubCreate):
-    price_id = (payload.price_id or "").strip()
-    success_url = payload.success_url
-    cancel_url = payload.cancel_url
-    email = (payload.email or "").strip() or None
-
-    if not (price_id and success_url and cancel_url):
-        raise HTTPException(400, "Missing price_id/success_url/cancel_url")
-    if price_id not in ALLOWED_PRICE_IDS:
-        raise HTTPException(400, "Invalid price_id")
-
-    session = stripe.checkout.Session.create(
-        mode="subscription",
-        payment_method_types=["card"],
-        line_items=[{"price": price_id, "quantity": 1}],
-        success_url=success_url,
-        cancel_url=cancel_url,
-        customer_email=email,
-        allow_promotion_codes=True,
-    )
-    return {"url": session.url}
-
-def _extract_plan(sub: Dict[str,Any]) -> Dict[str,Any]:
-    items = (sub.get("items",{}) or {}).get("data") or []
-    first = items[0] if items else {}
-    price = (first or {}).get("price") or {}
-    recurring = price.get("recurring") or {}
-    price_id = price.get("id")
-    bits = PLAN_CONFIG.get(price_id, {})
-    return {
-        "price_id": price_id,
-        "interval": recurring.get("interval") or bits.get("interval"),
-        "amount_cents": price.get("unit_amount"),
-        "currency": price.get("currency"),
-        "plan": bits.get("plan"),
-        "pots_per_month": bits.get("pots_per_month"),
-        "max_users_per_event": bits.get("max_users_per_event"),
-    }
-
-def _write_email(email_lc: str, cust_id: str, sub: Dict[str,Any]):
-    doc = {
-        "email": email_lc,
-        "status": sub.get("status"),
-        "current_period_end": sub.get("current_period_end"),
-        "stripe_customer_id": sub.get("customer") or cust_id,
-        "stripe_subscription_id": sub.get("id"),
-        "updated_at": firestore.SERVER_TIMESTAMP,
-        **_extract_plan(sub),
-    }
-    db.collection("organizer_subs_emails").document(email_lc).set(doc, merge=True)
-
-# ---------- Owner auth + rotate/revoke ----------
+# ------------------ Owner auth / rotate ------------------
 class OwnerAuth(BaseModel):
     key: Optional[str] = None
     code: Optional[str] = None
 
 def _require_owner(pot_id: str, auth: OwnerAuth):
+    # token (manage link) OR plaintext code
     if auth.key and verify_owner_token(pot_id, auth.key):
         return True
     if auth.code:
         snap = db.collection("pots").document(pot_id).get()
-        if not snap.exists: 
-            raise HTTPException(404, "Pot not found")
+        if not snap.exists: raise HTTPException(404, "Pot not found")
         if hash_code(auth.code) == (snap.to_dict() or {}).get("owner_code_hash"):
             return True
     raise HTTPException(401, "Invalid owner credentials")
 
 @app.post("/pots/{pot_id}/owner/auth")
 def owner_auth(pot_id: str, body: OwnerAuth):
-    _require_owner(pot_id, body)
-    return {"ok": True, "owner": True}
+    _require_owner(pot_id, body); return {"ok": True, "owner": True}
 
 @app.post("/pots/{pot_id}/owner/rotate-code")
 def owner_rotate_code(pot_id: str, body: OwnerAuth):
@@ -367,26 +265,7 @@ def owner_rotate_link(pot_id: str, body: OwnerAuth):
     }, merge=True)
     return {"ok": True, "manage_url": manage_url}
 
-@app.post("/pots/{pot_id}/owner/revoke-all")
-def owner_revoke_all(pot_id: str, body: OwnerAuth):
-    _require_owner(pot_id, body)
-    code = random_owner_code()
-    new_salt = b64url_encode(secrets.token_bytes(12))
-    db.collection("pots").document(pot_id).set({
-        "owner_code_hash": hash_code(code),
-        "owner_code_rotated_at": firestore.SERVER_TIMESTAMP,
-        "owner_token_salt": new_salt,
-        "owner_token_rotated_at": firestore.SERVER_TIMESTAMP,
-    }, merge=True)
-    token = make_owner_token(pot_id)
-    manage_url = f"{FRONTEND_BASE_URL}/manage?pot={pot_id}&key={token}"
-    db.collection("owner_links").document(pot_id).set({
-        "manage_url": manage_url,
-        "rotatedAt": firestore.SERVER_TIMESTAMP,
-    }, merge=True)
-    return {"ok": True, "new_code": code, "manage_url": manage_url}
-
-# ---------- Stripe webhook ----------
+# ------------------ Webhook ------------------
 @app.post("/webhook")
 async def webhook(request: Request):
     payload = await request.body()
@@ -395,7 +274,7 @@ async def webhook(request: Request):
         event = stripe.Webhook.construct_event(payload, sig, WEBHOOK_SECRET)
     except Exception as e:
         log.error("webhook_bad_signature", extra={"error": str(e)})
-        raise HTTPException(400, str(e))
+        raise HTTPException(400, "Bad signature")
 
     etype = event.get("type")
     obj = event.get("data",{}).get("object",{})
@@ -412,11 +291,15 @@ async def webhook(request: Request):
                 draft_ref = db.collection("pot_drafts").document(draft_id)
                 draft_snap = draft_ref.get()
                 draft = draft_snap.to_dict() if draft_snap.exists else {}
+
+                pot_ids = []
+                pots_payload = []
                 for _ in range(max(1, count)):
                     pot_id = db.collection("pots").document().id
-                    # create initial salt for this pot so future tokens are bound to it
+                    # create salt for owner token + owner code
                     initial_salt = b64url_encode(secrets.token_bytes(12))
                     code = random_owner_code()
+
                     db.collection("pots").document(pot_id).set({
                         **(draft or {}),
                         "status": "active",
@@ -429,15 +312,33 @@ async def webhook(request: Request):
                         "owner_code_hash": hash_code(code),
                         "owner_token_salt": initial_salt,
                     }, merge=True)
-                    # issue magic link using this pot's salt
+
                     token = make_owner_token(pot_id)
                     manage_url = f"{FRONTEND_BASE_URL}/manage?pot={pot_id}&key={token}"
                     db.collection("owner_links").document(pot_id).set({
                         "manage_url": manage_url,
                         "createdAt": firestore.SERVER_TIMESTAMP,
+                    }, merge=True)
+
+                    pot_ids.append(pot_id)
+                    # Store short-lived plaintext owner code for success page (Option B++)
+                    now = int(time.time())
+                    pots_payload.append({
+                        "pot_id": pot_id,
+                        "manage_url": manage_url,
+                        "owner_code_plain": code,
+                        "owner_code_plain_exp": now + OWNER_CODE_TTL_SECONDS,
                     })
+
+                # Write status doc for success page polling
+                db.collection("create_sessions").document(session["id"]).set({
+                    "ready": True,
+                    "updated_at": firestore.SERVER_TIMESTAMP,
+                    "pots": pots_payload,
+                }, merge=True)
+
+                # Clean up draft
                 draft_ref.delete()
-                db.collection("create_sessions").document(session["id"]).delete()
 
         elif flow == "join":
             pot_id = (session.get("metadata") or {}).get("pot_id")
@@ -453,81 +354,31 @@ async def webhook(request: Request):
                 }, merge=True)
                 db.collection("join_sessions").document(session["id"]).delete()
 
-        elif session.get("mode") == "subscription":
-            email = (session.get("customer_details") or {}).get("email") or session.get("customer_email")
-            email_lc = (email or "").lower()
-            sub_id = session.get("subscription")
-            if email_lc and sub_id:
-                sub = stripe.Subscription.retrieve(sub_id)
-                _write_email(email_lc, session.get("customer"), sub)
-
-    elif etype in ("invoice.payment_succeeded","customer.subscription.updated","customer.subscription.deleted","customer.subscription.paused"):
-        if etype.startswith("customer.subscription."):
-            sub = obj; cust_id = sub.get("customer")
-        else:
-            sub_id = obj.get("subscription"); cust_id = obj.get("customer")
-            sub = stripe.Subscription.retrieve(sub_id) if sub_id else None
-        if sub:
-            try:
-                cust = stripe.Customer.retrieve(cust_id) if cust_id else None
-                email = (cust.get("email") if cust else None) or ""
-                email_lc = email.lower() if email else None
-            except Exception:
-                email_lc = None
-            if email_lc:
-                _write_email(email_lc, cust_id, sub)
-
     return JSONResponse({"received": True})
 
-# ----------------------
-# Create Status Endpoints
-# ----------------------
-from fastapi import Query
-
-def _collect_create_status(session_id: str):
-    """
-    Look up any newly created pots for a given Stripe Checkout session_id.
-    Returns (ready: bool, results: list[dict]).
-    """
-    pots = []
-    try:
-        q = db.collection("pots").where("stripe_session_id", "==", session_id).stream()
-        for doc in q:
-            data = doc.to_dict() or {}
-            pot_id = doc.id
-            # Prefer cached manage_url if present; otherwise generate from pot's salt
-            link_doc = db.collection("owner_links").document(pot_id).get()
-            manage_url = None
-            if link_doc.exists:
-                manage_url = (link_doc.to_dict() or {}).get("manage_url")
-            if not manage_url:
-                try:
-                    token = make_owner_token(pot_id)
-                    manage_url = f"{FRONTEND_BASE_URL}/manage?pot={pot_id}&key={token}"
-                except Exception:
-                    manage_url = None
-            pots.append({
-                "pot_id": pot_id,
-                "status": data.get("status", "active"),
-                "manage_url": manage_url,
-            })
-    except Exception as e:
-        log.error("status_lookup_failed", extra={"error": str(e)})
-        pots = []
-
-    return (len(pots) > 0, pots)
-
-
+# ------------------ Create Status ------------------
 @app.get("/create-status")
 def create_status(session_id: str = Query(..., description="Stripe checkout session id")):
-    ready, pots = _collect_create_status(session_id)
-    if not ready:
-        # 404 signals the front-end to keep polling
+    doc = db.collection("create_sessions").document(session_id).get()
+    if not doc.exists:
+        # front-end will keep polling
         raise HTTPException(404, "not-ready")
-    return {"ready": True, "pots": pots, "count": len(pots)}
 
+    data = doc.to_dict() or {}
+    pots = data.get("pots") or data.get("results") or []
+    now = int(time.time())
+
+    cleaned = []
+    for p in pots:
+        out = {"pot_id": p.get("pot_id"), "manage_url": p.get("manage_url")}
+        exp = p.get("owner_code_plain_exp")
+        if isinstance(exp, int) and exp > now and p.get("owner_code_plain"):
+            out["owner_code"] = p["owner_code_plain"]
+        cleaned.append(out)
+
+    ready = bool(cleaned) and bool(data.get("ready"))
+    return {"ready": ready, "pots": cleaned, "count": len(cleaned)}
 
 @app.get("/create-status2")
-def create_status2(session_id: str = Query(..., description="Stripe checkout session id")):
-    # alias for older front-ends
+def create_status2(session_id: str = Query(...)):
     return create_status(session_id=session_id)
