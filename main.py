@@ -1,6 +1,6 @@
 import os, json, logging, base64, hashlib, hmac, time, secrets
 from datetime import datetime, timezone
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from urllib.parse import quote
 
 from fastapi import FastAPI, Request, HTTPException, Query
@@ -84,6 +84,28 @@ def verify_owner_token(pot_id: str, token: str) -> bool:
     except Exception:
         return False
 
+def _public_pot_dict(doc_id: str, data: dict) -> dict:
+    # expose only fields useful for listing & joining
+    return {
+        "pot_id": doc_id,
+        "status": data.get("status", "active"),
+        "name": data.get("name") or data.get("tournament_name") or data.get("event_name"),
+        "event_name": data.get("event_name"),
+        "tournament_name": data.get("tournament_name"),
+        "location": data.get("location") or data.get("city"),
+        "member_buy_in": data.get("member_buy_in") or data.get("buy_in"),
+        "createdAt": data.get("createdAt").isoformat() if hasattr(data.get("createdAt"), "isoformat") else str(data.get("createdAt")),
+    }
+
+def _matches_query(p: dict, q: str) -> bool:
+    if not q: return True
+    ql = q.lower()
+    for k in ("name","event_name","tournament_name","location","pot_id"):
+        v = p.get(k)
+        if v and ql in str(v).lower():
+            return True
+    return False
+
 # ------------------ FastAPI ------------------
 app = FastAPI(title="PicklePot Backend")
 app.add_middleware(
@@ -99,6 +121,46 @@ def root():
 @app.get("/health")
 def health():
     return {"ok": True, "now": utcnow().isoformat()}
+
+# ------------------ Public list/search of Active Tournaments ------------------
+@app.get("/pots")
+def list_pots(q: Optional[str] = Query(None, description="search text"),
+              limit: int = Query(50, ge=1, le=200)):
+    """Public endpoint: list active/open pots for browsing/joining. Anyone can call this."""
+    try:
+        pots: List[dict] = []
+        try:
+            stream = (db.collection("pots")
+                        .where("status", "in", ["active", "open"])
+                        .order_by("createdAt", direction=firestore.Query.DESCENDING)
+                        .limit(limit * 2)
+                        .stream())
+            for d in stream:
+                data = d.to_dict() or {}
+                public = _public_pot_dict(d.id, data)
+                if _matches_query(public, q):
+                    pots.append(public)
+                if len(pots) >= limit: break
+        except Exception as e:
+            seen = {}
+            for status in ("active","open"):
+                try:
+                    qref = db.collection("pots").where("status","==",status).limit(limit * 2)
+                    for d in qref.stream():
+                        data = d.to_dict() or {}
+                        public = _public_pot_dict(d.id, data)
+                        if _matches_query(public, q):
+                            seen[d.id] = public
+                except Exception:
+                    pass
+            pots = list(seen.values())
+            pots.sort(key=lambda x: x.get("createdAt",""), reverse=True)
+            pots = pots[:limit]
+
+        return {"ok": True, "pots": pots, "count": len(pots)}
+    except Exception as e:
+        log.error("list_pots_error", extra={"error": str(e)})
+        raise HTTPException(500, "Failed to list active tournaments")
 
 # ------------------ Create-a-Pot ------------------
 class CreatePotPayload(BaseModel):
@@ -119,7 +181,6 @@ async def create_pot_session(payload: CreatePotPayload, request: Request):
     if amount_cents < 50:
         raise HTTPException(400, "Minimum amount is 50 cents")
 
-    # stash the draft
     draft_ref = db.collection("pot_drafts").document()
     draft_ref.set({**draft, "status": "draft", "createdAt": utcnow()}, merge=True)
 
@@ -154,7 +215,6 @@ def cancel_create(session_id: str, next: str = "/"):
     draft_id = (snap.to_dict() or {}).get("draft_id") if snap.exists else None
     if draft_id:
         db.collection("pot_drafts").document(draft_id).delete()
-    # Remove any pots created under this session (belt and braces)
     try:
         for pot_doc in db.collection("pots").where("stripe_session_id", "==", session_id).stream():
             pot_doc.reference.delete()
@@ -225,7 +285,6 @@ class OwnerAuth(BaseModel):
     code: Optional[str] = None
 
 def _require_owner(pot_id: str, auth: OwnerAuth):
-    # token (manage link) OR plaintext code
     if auth.key and verify_owner_token(pot_id, auth.key):
         return True
     if auth.code:
@@ -292,11 +351,9 @@ async def webhook(request: Request):
                 draft_snap = draft_ref.get()
                 draft = draft_snap.to_dict() if draft_snap.exists else {}
 
-                pot_ids = []
                 pots_payload = []
                 for _ in range(max(1, count)):
                     pot_id = db.collection("pots").document().id
-                    # create salt for owner token + owner code
                     initial_salt = b64url_encode(secrets.token_bytes(12))
                     code = random_owner_code()
 
@@ -320,8 +377,6 @@ async def webhook(request: Request):
                         "createdAt": firestore.SERVER_TIMESTAMP,
                     }, merge=True)
 
-                    pot_ids.append(pot_id)
-                    # Store short-lived plaintext owner code for success page (Option B++)
                     now = int(time.time())
                     pots_payload.append({
                         "pot_id": pot_id,
@@ -330,14 +385,12 @@ async def webhook(request: Request):
                         "owner_code_plain_exp": now + OWNER_CODE_TTL_SECONDS,
                     })
 
-                # Write status doc for success page polling
                 db.collection("create_sessions").document(session["id"]).set({
                     "ready": True,
                     "updated_at": firestore.SERVER_TIMESTAMP,
                     "pots": pots_payload,
                 }, merge=True)
 
-                # Clean up draft
                 draft_ref.delete()
 
         elif flow == "join":
@@ -361,7 +414,6 @@ async def webhook(request: Request):
 def create_status(session_id: str = Query(..., description="Stripe checkout session id")):
     doc = db.collection("create_sessions").document(session_id).get()
     if not doc.exists:
-        # front-end will keep polling
         raise HTTPException(404, "not-ready")
 
     data = doc.to_dict() or {}
