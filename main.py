@@ -427,3 +427,17 @@ def create_status(session_id: str = Query(..., description="Stripe checkout sess
 @app.get("/create-status2")
 def create_status2(session_id: str = Query(...)):
     return create_status(session_id=session_id)
+
+
+from fastapi import Request
+
+@app.post("/pots/{pot_id}/owner/entries/{entry_id}/toggle-paid")
+async def owner_toggle_paid(pot_id: str, entry_id: str, request: Request):
+    data = await request.json()
+    entry_ref = db.collection("pots").document(pot_id).collection("entries").document(entry_id)
+    snap = entry_ref.get()
+    if not snap.exists:
+        return {"ok": False, "error": "entry not found"}
+    paid = bool((snap.to_dict() or {}).get("paid"))
+    entry_ref.update({"paid": not paid})
+    return {"ok": True, "paid": not paid}
