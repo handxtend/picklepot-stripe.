@@ -46,11 +46,6 @@ def utcnow():
 def server_base(request: Request) -> str:
     return f"{request.url.scheme}://{request.headers.get('host')}"
 
-def strip_query(url: str) -> str:
-    from urllib.parse import urlsplit, urlunsplit
-    p = urlsplit(url)
-    return urlunsplit((p.scheme, p.netloc, p.path, "", ""))
-
 def b64url_encode(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).decode().rstrip("=")
 
@@ -92,7 +87,7 @@ def verify_owner_token(pot_id: str, token: str) -> bool:
 def _public_pot_dict(doc_id: str, data: dict) -> dict:
     return {
         "pot_id": doc_id,
-        "status": data.get("status", "open"),
+        "status": data.get("status", "active"),
         "name": data.get("name") or data.get("tournament_name") or data.get("event_name"),
         "event": data.get("event"),
         "location": data.get("location") or data.get("city"),
@@ -130,10 +125,10 @@ def health():
 @app.get("/pots")
 def list_pots(q: Optional[str] = Query(None, description="search text"),
               limit: int = Query(50, ge=1, le=200)):
-    """Public endpoint: list open pots for browsing/joining. Anyone can call this."""
+    """Public endpoint: list ACTIVE pots for browsing/joining."""
     try:
         pots = []
-        query = db.collection("pots").where("status", "==", "open")
+        query = db.collection("pots").where("status", "==", "active")
         try:
             stream = query.order_by("createdAt", direction=firestore.Query.DESCENDING).limit(limit*2).stream()
         except Exception:
@@ -296,7 +291,6 @@ def resolve_owner_code(token: Optional[str] = None, code: Optional[str] = None):
             pass
         raise HTTPException(400, "Invalid token")
     if code:
-        # brute-light: search latest 100 pots
         for d in db.collection("pots").order_by("createdAt", direction=firestore.Query.DESCENDING).limit(100).stream():
             data = d.to_dict() or {}
             if hash_code(code) == data.get("owner_code_hash"):
@@ -364,11 +358,9 @@ async def webhook(request: Request):
 
         pots_created = []
         for i in range(count):
-            # create pot doc
             pot_ref = db.collection("pots").document()  # auto id
             pot_id = pot_ref.id
 
-            # owner secrets
             owner_code = random_owner_code()
             owner_hash = hash_code(owner_code)
             owner_salt = b64url_encode(secrets.token_bytes(12))
@@ -385,7 +377,7 @@ async def webhook(request: Request):
                 "location": draft.get("location") or draft.get("city") or "",
                 "date": draft.get("date") or "",
                 "time": draft.get("time") or "",
-                "status": "open",                    # IMPORTANT for frontend Active list
+                "status": "active",                # IMPORTANT: now shows in Active Tournaments
                 "public": True,
                 "createdAt": utcnow(),
                 "stripe_session_id": session_id,
@@ -396,7 +388,6 @@ async def webhook(request: Request):
                 "owner_token_salt": owner_salt,
             }
             pot_ref.set(pot_doc, merge=True)
-            # pre-create subcollection maybe later
 
             pots_created.append({
                 "pot_id": pot_id,
@@ -404,12 +395,10 @@ async def webhook(request: Request):
                 "owner_code": owner_code,
             })
 
-        # cleanup draft + flip ready
         if draft_id:
             db.collection("pot_drafts").document(draft_id).delete()
         cs_ref.set({"ready": True, "pots": pots_created, "count": len(pots_created)}, merge=True)
 
-        # ephemeral exposure of plaintext code
         exp = int(time.time()) + OWNER_CODE_TTL_SECONDS
         db.collection("create_status").document(session_id).set({
             "ready": True,
@@ -440,7 +429,6 @@ def create_status(session_id: str):
     if not m.get("ready"):
         raise HTTPException(404, "Not ready")
     pots = m.get("pots") or []
-    # strip owner_code for stale reads
     safe = []
     for p in pots:
         safe.append({"pot_id": p.get("pot_id"), "manage_url": p.get("manage_url")})
