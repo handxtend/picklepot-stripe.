@@ -46,6 +46,12 @@ def utcnow():
 def server_base(request: Request) -> str:
     return f"{request.url.scheme}://{request.headers.get('host')}"
 
+def strip_query(url: str) -> str:
+    """Return url without query/fragment (scheme+netloc+path)."""
+    from urllib.parse import urlsplit, urlunsplit
+    p = urlsplit(url)
+    return urlunsplit((p.scheme, p.netloc, p.path, "", ""))
+
 def b64url_encode(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).decode().rstrip("=")
 
@@ -171,6 +177,8 @@ async def create_pot_session(payload: CreatePotPayload, request: Request):
     draft_ref = db.collection("pot_drafts").document()
     draft_ref.set({**draft, "status": "draft", "createdAt": utcnow()}, merge=True)
 
+    success_base = strip_query(payload.success_url)
+    cancel_base = strip_query(payload.cancel_url)
     session = stripe.checkout.Session.create(
         mode="payment",
         line_items=[{
