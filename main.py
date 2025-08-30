@@ -85,21 +85,22 @@ def verify_owner_token(pot_id: str, token: str) -> bool:
         return False
 
 def _public_pot_dict(doc_id: str, data: dict) -> dict:
+    # expose only fields useful for listing & joining
     return {
         "pot_id": doc_id,
         "status": data.get("status", "active"),
         "name": data.get("name") or data.get("tournament_name") or data.get("event_name"),
-        "event": data.get("event"),
+        "event_name": data.get("event_name"),
+        "tournament_name": data.get("tournament_name"),
         "location": data.get("location") or data.get("city"),
-        "buyin_member": data.get("buyin_member") or data.get("member_buy_in"),
-        "buyin_guest": data.get("buyin_guest") or data.get("guest_buy_in"),
+        "member_buy_in": data.get("member_buy_in") or data.get("buy_in"),
         "createdAt": data.get("createdAt").isoformat() if hasattr(data.get("createdAt"), "isoformat") else str(data.get("createdAt")),
     }
 
 def _matches_query(p: dict, q: str) -> bool:
     if not q: return True
     ql = q.lower()
-    for k in ("name","event","location","pot_id"):
+    for k in ("name","event_name","tournament_name","location","pot_id"):
         v = p.get(k)
         if v and ql in str(v).lower():
             return True
@@ -125,26 +126,50 @@ def health():
 @app.get("/pots")
 def list_pots(q: Optional[str] = Query(None, description="search text"),
               limit: int = Query(50, ge=1, le=200)):
-    """Public endpoint: list ACTIVE pots for browsing/joining."""
+    """Public endpoint: list active pots for browsing/joining. Anyone can call this.
+       Tolerates mixed timestamp fields (createdAt vs created_at) and returns
+       both legacy 'open' and new 'active' statuses, sorted by most recent.
+    """
     try:
-        pots = []
-        query = db.collection("pots").where("status", "==", "active")
+        pots: List[Dict[str, Any]] = []
+
+        def _collect(query):
+            try:
+                # Avoid order_by to tolerate missing/variant timestamp fields
+                return list(query.limit(limit * 5).stream())
+            except Exception:
+                return []
+
+        # Fetch active + (legacy) open
+        snaps = _collect(db.collection("pots").where("status", "==", "active"))
         try:
-            stream = query.order_by("createdAt", direction=firestore.Query.DESCENDING).limit(limit*2).stream()
+            snaps += _collect(db.collection("pots").where("status", "==", "open"))
         except Exception:
-            stream = query.limit(limit*2).stream()
-        for d in stream:
-            data = d.to_dict() or {}
-            public = _public_pot_dict(d.id, data)
-            if _matches_query(public, q):
-                pots.append(public)
-            if len(pots) >= limit:
-                break
-        return {"ok": True, "pots": pots, "count": len(pots)}
+            pass  # if index missing, skip legacy
+
+        for d in snaps:
+            try:
+                data = d.to_dict() or {}
+                # accept both timestamp field names
+                ts = data.get("createdAt") or data.get("created_at")
+                public = _public_pot_dict(d.id, data)
+                public["createdAt"] = ts  # expose whichever we found
+                if _matches_query(public, q):
+                    pots.append(public)
+            except Exception as e:
+                # continue on per-doc errors
+                continue
+
+        # sort newest first; Firestore Timestamp objects sort fine
+        def _ts(p):
+            return p.get("createdAt") or 0
+        pots.sort(key=_ts, reverse=True)
+
+        return {"ok": True, "pots": pots[:limit], "count": len(pots[:limit])}
     except Exception as e:
         log.error("list_pots_error", extra={"error": str(e)})
-        raise HTTPException(500, "Failed to list active tournaments")
-
+        # Return structured error rather than raising to prevent 500 masking
+        return JSONResponse(status_code=500, content={"detail": f"Failed to list active tournaments: {str(e)}"})
 # ------------------ Create-a-Pot ------------------
 class CreatePotPayload(BaseModel):
     draft: Dict[str, Any] | None = None
@@ -199,6 +224,7 @@ def cancel_create(session_id: str, next: str = "/"):
     draft_id = (snap.to_dict() or {}).get("draft_id") if snap.exists else None
     if draft_id:
         db.collection("pot_drafts").document(draft_id).delete()
+    # Remove any pots created under this session (belt and braces)
     try:
         for pot_doc in db.collection("pots").where("stripe_session_id", "==", session_id).stream():
             pot_doc.reference.delete()
@@ -263,12 +289,13 @@ def cancel_join(session_id: str, pot_id: Optional[str] = None, entry_id: Optiona
                 entry_ref.delete()
     return RedirectResponse(next, status_code=302)
 
-# ------------------ Owner auth / rotate / resolve ------------------
+# ------------------ Owner auth / rotate ------------------
 class OwnerAuth(BaseModel):
     key: Optional[str] = None
     code: Optional[str] = None
 
 def _require_owner(pot_id: str, auth: OwnerAuth):
+    # token (manage link) OR plaintext code
     if auth.key and verify_owner_token(pot_id, auth.key):
         return True
     if auth.code:
@@ -277,26 +304,6 @@ def _require_owner(pot_id: str, auth: OwnerAuth):
         if hash_code(auth.code) == (snap.to_dict() or {}).get("owner_code_hash"):
             return True
     raise HTTPException(401, "Invalid owner credentials")
-
-@app.get("/resolve-owner-code")
-def resolve_owner_code(token: Optional[str] = None, code: Optional[str] = None):
-    if token:
-        try:
-            p_b64, mac_b64 = token.split(".")
-            payload = b64url_decode(p_b64).decode()
-            pot_id, _ = payload.split(".")
-            if verify_owner_token(pot_id, token):
-                return {"pot_id": pot_id}
-        except Exception:
-            pass
-        raise HTTPException(400, "Invalid token")
-    if code:
-        for d in db.collection("pots").order_by("createdAt", direction=firestore.Query.DESCENDING).limit(100).stream():
-            data = d.to_dict() or {}
-            if hash_code(code) == data.get("owner_code_hash"):
-                return {"pot_id": d.id}
-        raise HTTPException(404, "Code not found")
-    raise HTTPException(400, "Provide token or code")
 
 @app.post("/pots/{pot_id}/owner/auth")
 def owner_auth(pot_id: str, body: OwnerAuth):
@@ -336,100 +343,109 @@ async def webhook(request: Request):
     try:
         event = stripe.Webhook.construct_event(payload, sig, WEBHOOK_SECRET)
     except Exception as e:
-        log.error("webhook_verify_failed", extra={"error": str(e)})
-        raise HTTPException(400, "Invalid signature")
+        log.error("webhook_bad_signature", extra={"error": str(e)})
+        raise HTTPException(400, "Bad signature")
 
-    et = event["type"]
-    data = event["data"]["object"]
-    log.info(f"webhook {et} id={data.get('id')}")
+    etype = event.get("type")
+    obj = event.get("data",{}).get("object",{})
+    log.info("webhook_event_received", extra={"type": etype})
 
-    # Create flow
-    if et == "checkout.session.completed" and data.get("metadata", {}).get("flow") == "create":
-        session_id = data.get("id")
-        cs_ref = db.collection("create_sessions").document(session_id)
-        cs_snap = cs_ref.get()
-        if not cs_snap.exists:
-            log.warning("no_create_session_map", extra={"session": session_id})
-            return JSONResponse({"ok": True})
-        map_data = cs_snap.to_dict() or {}
-        draft_id = map_data.get("draft_id")
-        count = int(map_data.get("count") or 1)
-        draft = (db.collection("pot_drafts").document(draft_id).get().to_dict() if draft_id else {}) or {}
+    if etype == "checkout.session.completed":
+        session = obj
+        flow = (session.get("metadata") or {}).get("flow")
 
-        pots_created = []
-        for i in range(count):
-            pot_ref = db.collection("pots").document()  # auto id
-            pot_id = pot_ref.id
+        if flow == "create":
+            draft_id = (session.get("metadata") or {}).get("draft_id")
+            count = int((session.get("metadata") or {}).get("count", "1"))
+            if draft_id:
+                draft_ref = db.collection("pot_drafts").document(draft_id)
+                draft_snap = draft_ref.get()
+                draft = draft_snap.to_dict() if draft_snap.exists else {}
 
-            owner_code = random_owner_code()
-            owner_hash = hash_code(owner_code)
-            owner_salt = b64url_encode(secrets.token_bytes(12))
-            tok = make_owner_token(pot_id)
-            manage_url = f"{FRONTEND_BASE_URL}/manage?pot={pot_id}&key={tok}"
+                pots_payload = []
+                for _ in range(max(1, count)):
+                    pot_id = db.collection("pots").document().id
+                    # create salt for owner token + owner code
+                    initial_salt = b64url_encode(secrets.token_bytes(12))
+                    code = random_owner_code()
 
-            pot_doc = {
-                "name": draft.get("name") or draft.get("tournament_name") or "Tournament",
-                "organizer": draft.get("organizer") or "Pickleball Compete",
-                "event": draft.get("event") or draft.get("event_name"),
-                "skill": draft.get("skill") or "Any",
-                "buyin_member": draft.get("buyin_member") or draft.get("member_buy_in") or 0,
-                "buyin_guest": draft.get("buyin_guest") or draft.get("guest_buy_in") or 0,
-                "location": draft.get("location") or draft.get("city") or "",
-                "date": draft.get("date") or "",
-                "time": draft.get("time") or "",
-                "status": "active",                # IMPORTANT: now shows in Active Tournaments
-                "public": True,
-                "createdAt": utcnow(),
-                "stripe_session_id": session_id,
-                "payment_methods": draft.get("payment_methods") or {
-                    "stripe": True, "zelle": False, "cashapp": False, "onsite": False
-                },
-                "owner_code_hash": owner_hash,
-                "owner_token_salt": owner_salt,
-            }
-            pot_ref.set(pot_doc, merge=True)
+                    db.collection("pots").document(pot_id).set({
+                        **(draft or {}),
+                        "status": "active",
+                        "createdAt": utcnow(),
+                        "source": "checkout",
+                        "draft_id": draft_id,
+                        "stripe_session_id": session["id"],
+                        "amount_total": session.get("amount_total"),
+                        "currency": session.get("currency", "usd"),
+                        "owner_code_hash": hash_code(code),
+                        "owner_token_salt": initial_salt,
+                    }, merge=True)
 
-            pots_created.append({
-                "pot_id": pot_id,
-                "manage_url": manage_url,
-                "owner_code": owner_code,
-            })
+                    token = make_owner_token(pot_id)
+                    manage_url = f"{FRONTEND_BASE_URL}/manage?pot={pot_id}&key={token}"
+                    db.collection("owner_links").document(pot_id).set({
+                        "manage_url": manage_url,
+                        "createdAt": firestore.SERVER_TIMESTAMP,
+                    }, merge=True)
 
-        if draft_id:
-            db.collection("pot_drafts").document(draft_id).delete()
-        cs_ref.set({"ready": True, "pots": pots_created, "count": len(pots_created)}, merge=True)
+                    now = int(time.time())
+                    pots_payload.append({
+                        "pot_id": pot_id,
+                        "manage_url": manage_url,
+                        "owner_code_plain": code,
+                        "owner_code_plain_exp": now + OWNER_CODE_TTL_SECONDS,
+                    })
 
-        exp = int(time.time()) + OWNER_CODE_TTL_SECONDS
-        db.collection("create_status").document(session_id).set({
-            "ready": True,
-            "pots": pots_created,
-            "expireAt": exp,
-        }, merge=True)
+                # Write status doc for success page polling
+                db.collection("create_sessions").document(session["id"]).set({
+                    "ready": True,
+                    "updated_at": firestore.SERVER_TIMESTAMP,
+                    "pots": pots_payload,
+                }, merge=True)
 
-        return JSONResponse({"ok": True})
+                # Clean up draft
+                draft_ref.delete()
 
-    return JSONResponse({"ok": True})
+        elif flow == "join":
+            pot_id = (session.get("metadata") or {}).get("pot_id")
+            entry_id = (session.get("metadata") or {}).get("entry_id")
+            if pot_id and entry_id:
+                entry_ref = db.collection("pots").document(pot_id).collection("entries").document(entry_id)
+                entry_ref.set({
+                    "paid": True,
+                    "paid_amount": session.get("amount_total"),
+                    "paid_at": utcnow(),
+                    "payment_method": "stripe",
+                    "stripe_session_id": session["id"],
+                }, merge=True)
+                db.collection("join_sessions").document(session["id"]).delete()
 
-# ------------------ Create Status (polled by success.html) ------------------
+    return JSONResponse({"received": True})
+
+# ------------------ Create Status ------------------
 @app.get("/create-status")
-def create_status(session_id: str):
-    # First, try the ephemeral cache
-    doc = db.collection("create_status").document(session_id).get()
-    if doc.exists:
-        data = doc.to_dict() or {}
-        expire = int(data.get("expireAt") or 0)
-        if expire > int(time.time()):
-            return data
+def create_status(session_id: str = Query(..., description="Stripe checkout session id")):
+    doc = db.collection("create_sessions").document(session_id).get()
+    if not doc.exists:
+        # front-end will keep polling
+        raise HTTPException(404, "not-ready")
 
-    # Fallback to session map (no plaintext owner code if too old)
-    cs = db.collection("create_sessions").document(session_id).get()
-    if not cs.exists:
-        raise HTTPException(404, "Not found")
-    m = cs.to_dict() or {}
-    if not m.get("ready"):
-        raise HTTPException(404, "Not ready")
-    pots = m.get("pots") or []
-    safe = []
+    data = doc.to_dict() or {}
+    pots = data.get("pots") or data.get("results") or []
+    now = int(time.time())
+
+    cleaned = []
     for p in pots:
-        safe.append({"pot_id": p.get("pot_id"), "manage_url": p.get("manage_url")})
-    return {"ready": True, "pots": safe, "count": len(safe)}
+        out = {"pot_id": p.get("pot_id"), "manage_url": p.get("manage_url")}
+        exp = p.get("owner_code_plain_exp")
+        if isinstance(exp, int) and exp > now and p.get("owner_code_plain"):
+            out["owner_code"] = p["owner_code_plain"]
+        cleaned.append(out)
+
+    ready = bool(cleaned) and bool(data.get("ready"))
+    return {"ready": ready, "pots": cleaned, "count": len(cleaned)}
+
+@app.get("/create-status2")
+def create_status2(session_id: str = Query(...)):
+    return create_status(session_id=session_id)
