@@ -126,50 +126,28 @@ def health():
 @app.get("/pots")
 def list_pots(q: Optional[str] = Query(None, description="search text"),
               limit: int = Query(50, ge=1, le=200)):
-    """Public endpoint: list active pots for browsing/joining. Anyone can call this.
-       Tolerates mixed timestamp fields (createdAt vs created_at) and returns
-       both legacy 'open' and new 'active' statuses, sorted by most recent.
-    """
+    """Public endpoint: list active pots for browsing/joining. Anyone can call this."""
     try:
-        pots: List[Dict[str, Any]] = []
-
-        def _collect(query):
-            try:
-                # Avoid order_by to tolerate missing/variant timestamp fields
-                return list(query.limit(limit * 5).stream())
-            except Exception:
-                return []
-
-        # Fetch active + (legacy) open
-        snaps = _collect(db.collection("pots").where("status", "==", "active"))
+        # Query active pots; order by createdAt desc if present
+        pots = []
+        query = db.collection("pots").where("status", "==", "active")
+        # Try to order by createdAt if indexed, otherwise fallback unordered
         try:
-            snaps += _collect(db.collection("pots").where("status", "==", "open"))
+            stream = query.order_by("createdAt", direction=firestore.Query.DESCENDING).limit(limit*2).stream()
         except Exception:
-            pass  # if index missing, skip legacy
-
-        for d in snaps:
-            try:
-                data = d.to_dict() or {}
-                # accept both timestamp field names
-                ts = data.get("createdAt") or data.get("created_at")
-                public = _public_pot_dict(d.id, data)
-                public["createdAt"] = ts  # expose whichever we found
-                if _matches_query(public, q):
-                    pots.append(public)
-            except Exception as e:
-                # continue on per-doc errors
-                continue
-
-        # sort newest first; Firestore Timestamp objects sort fine
-        def _ts(p):
-            return p.get("createdAt") or 0
-        pots.sort(key=_ts, reverse=True)
-
-        return {"ok": True, "pots": pots[:limit], "count": len(pots[:limit])}
+            stream = query.limit(limit*2).stream()
+        for d in stream:
+            data = d.to_dict() or {}
+            public = _public_pot_dict(d.id, data)
+            if _matches_query(public, q):
+                pots.append(public)
+            if len(pots) >= limit:
+                break
+        return {"ok": True, "pots": pots, "count": len(pots)}
     except Exception as e:
         log.error("list_pots_error", extra={"error": str(e)})
-        # Return structured error rather than raising to prevent 500 masking
-        return JSONResponse(status_code=500, content={"detail": f"Failed to list active tournaments: {str(e)}"})
+        raise HTTPException(500, "Failed to list active tournaments")
+
 # ------------------ Create-a-Pot ------------------
 class CreatePotPayload(BaseModel):
     draft: Dict[str, Any] | None = None
