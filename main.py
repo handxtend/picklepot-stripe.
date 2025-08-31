@@ -214,20 +214,30 @@ def cancel_create(session_id: str, next: str = "/"):
 # ------------------ Join-a-Pot ------------------
 class JoinPayload(BaseModel):
     pot_id: str
-    entry_id: str
+    entry_id: Optional[str] = None
     amount_cents: int
     success_url: str
     cancel_url: str
     player_name: Optional[str] = "Player"
     player_email: Optional[str] = None
 
+
 @app.post("/create-checkout-session")
 async def create_checkout_session(payload: JoinPayload, request: Request):
     pot_id = payload.pot_id
-    if not pot_id or not payload.entry_id:
-        raise HTTPException(400, "Missing pot_id or entry_id")
+    if not pot_id:
+        raise HTTPException(400, "Missing pot_id")
     if payload.amount_cents < 50:
         raise HTTPException(400, "Minimum amount is 50 cents")
+
+    # Build metadata; entry_id may be omitted for entry-less flow
+    md = {
+        "flow": "join",
+        "pot_id": pot_id,
+        "entry_id": payload.entry_id or "",
+        "player_email": (payload.player_email or ""),
+        "player_name": (payload.player_name or ""),
+    }
 
     session = stripe.checkout.Session.create(
         mode="payment",
@@ -240,12 +250,18 @@ async def create_checkout_session(payload: JoinPayload, request: Request):
             "quantity": 1,
         }],
         customer_email=payload.player_email,
-        success_url=f"{payload.success_url}?flow=join&session_id={{CHECKOUT_SESSION_ID}}&pot_id={pot_id}&entry_id={payload.entry_id}",
-        cancel_url=f"{server_base(request)}/cancel-join?session_id={{CHECKOUT_SESSION_ID}}&pot_id={pot_id}&entry_id={payload.entry_id}&next={quote(payload.cancel_url)}",
-        metadata={"flow": "join", "pot_id": pot_id, "entry_id": payload.entry_id, "player_email": payload.player_email or ""},
+        success_url=f"{payload.success_url}?flow=join&session_id={{CHECKOUT_SESSION_ID}}&pot_id={pot_id}" + (f"&entry_id={payload.entry_id}" if payload.entry_id else ""),
+        cancel_url=f"{server_base(request)}/cancel-join?session_id={{CHECKOUT_SESSION_ID}}&pot_id={pot_id}&next={quote(payload.cancel_url)}" + (f"&entry_id={payload.entry_id}" if payload.entry_id else ""),
+        metadata=md,
     )
 
-    db.collection("join_sessions").document(session["id"]).set({"pot_id": pot_id,"entry_id": payload.entry_id,"createdAt": utcnow()})
+    # Record session mapping for cancel cleanup
+    db.collection("join_sessions").document(session["id"]).set({
+        "pot_id": pot_id,
+        **({"entry_id": payload.entry_id} if payload.entry_id else {}),
+        "createdAt": utcnow(),
+    }, merge=True)
+
     return {"url": session.url, "session_id": session["id"]}
 
 @app.get("/cancel-join")
@@ -385,19 +401,51 @@ async def webhook(request: Request):
                 # Clean up draft
                 draft_ref.delete()
 
+        
         elif flow == "join":
             pot_id = (session.get("metadata") or {}).get("pot_id")
-            entry_id = (session.get("metadata") or {}).get("entry_id")
-            if pot_id and entry_id:
-                entry_ref = db.collection("pots").document(pot_id).collection("entries").document(entry_id)
-                entry_ref.set({
-                    "paid": True,
-                    "paid_amount": session.get("amount_total"),
-                    "paid_at": utcnow(),
-                    "payment_method": "stripe",
-                    "stripe_session_id": session["id"],
-                }, merge=True)
-                db.collection("join_sessions").document(session["id"]).delete()
+            entry_id = (session.get("metadata") or {}).get("entry_id") or ""
+            player_name = (session.get("metadata") or {}).get("player_name") or "Player"
+            player_email = (session.get("metadata") or {}).get("player_email") or ""
+            if pot_id:
+                if entry_id:
+                    # Legacy path: entry already exists; just mark as paid
+                    entry_ref = db.collection("pots").document(pot_id).collection("entries").document(entry_id)
+                    entry_ref.set({
+                        "paid": True,
+                        "paid_amount": session.get("amount_total"),
+                        "paid_at": utcnow(),
+                        "payment_method": "stripe",
+                        "stripe_session_id": session["id"],
+                        "status": "active",
+                    }, merge=True)
+                else:
+                    # Entry-less flow: create the entry only after successful payment (no ghosts)
+                    entries_ref = db.collection("pots").document(pot_id).collection("entries")
+                    new_ref = entries_ref.document()
+                    entry_doc = {
+                        "name": player_name,
+                        "name_lc": player_name.lower(),
+                        "email": player_email,
+                        "email_lc": player_email.lower(),
+                        "member_type": None,
+                        "player_skill": None,
+                        "pay_type": "Stripe",
+                        "applied_buyin": round((session.get("amount_total") or 0) / 100, 2),
+                        "paid": True,
+                        "paid_amount": session.get("amount_total"),
+                        "paid_at": utcnow(),
+                        "payment_method": "stripe",
+                        "stripe_session_id": session["id"],
+                        "status": "active",
+                        "created_at": utcnow(),
+                    }
+                    new_ref.set(entry_doc, merge=True)
+                # Clean mapping
+                try:
+                    db.collection("join_sessions").document(session["id"]).delete()
+                except Exception:
+                    pass
 
     return JSONResponse({"received": True})
 
@@ -427,16 +475,3 @@ def create_status(session_id: str = Query(..., description="Stripe checkout sess
 @app.get("/create-status2")
 def create_status2(session_id: str = Query(...)):
     return create_status(session_id=session_id)
-
-from fastapi import Request
-
-@app.post("/pots/{pot_id}/owner/entries/{entry_id}/toggle-paid")
-async def owner_toggle_paid(pot_id: str, entry_id: str, request: Request):
-    data = await request.json()
-    entry_ref = db.collection("pots").document(pot_id).collection("entries").document(entry_id)
-    snap = entry_ref.get()
-    if not snap.exists:
-        return {"ok": False, "error": "entry not found"}
-    paid = bool((snap.to_dict() or {}).get("paid"))
-    entry_ref.update({"paid": not paid})
-    return {"ok": True, "paid": not paid}
