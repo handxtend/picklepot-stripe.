@@ -108,6 +108,20 @@ def _matches_query(p: dict, q: str) -> bool:
 
 # ------------------ FastAPI ------------------
 app = FastAPI(title="PicklePot Backend")
+
+
+# ---- CORS (allow Netlify origin or *) ----
+from fastapi.middleware.cors import CORSMiddleware
+import os
+CORS_ALLOW = os.getenv("CORS_ALLOW") or os.getenv("CORS_ORIGINS") or "*"
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"] if (CORS_ALLOW == "*" or not CORS_ALLOW) else [o.strip() for o in CORS_ALLOW.split(",") if o.strip()],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"] if (CORS_ALLOW == "*" or not CORS_ALLOW) else [o.strip() for o in CORS_ALLOW.split(",") if o.strip()],
@@ -214,30 +228,20 @@ def cancel_create(session_id: str, next: str = "/"):
 # ------------------ Join-a-Pot ------------------
 class JoinPayload(BaseModel):
     pot_id: str
-    entry_id: Optional[str] = None
+    entry_id: str
     amount_cents: int
     success_url: str
     cancel_url: str
     player_name: Optional[str] = "Player"
     player_email: Optional[str] = None
 
-
 @app.post("/create-checkout-session")
 async def create_checkout_session(payload: JoinPayload, request: Request):
     pot_id = payload.pot_id
-    if not pot_id:
-        raise HTTPException(400, "Missing pot_id")
+    if not pot_id or not payload.entry_id:
+        raise HTTPException(400, "Missing pot_id or entry_id")
     if payload.amount_cents < 50:
         raise HTTPException(400, "Minimum amount is 50 cents")
-
-    # Build metadata; entry_id may be omitted for entry-less flow
-    md = {
-        "flow": "join",
-        "pot_id": pot_id,
-        "entry_id": payload.entry_id or "",
-        "player_email": (payload.player_email or ""),
-        "player_name": (payload.player_name or ""),
-    }
 
     session = stripe.checkout.Session.create(
         mode="payment",
@@ -250,18 +254,12 @@ async def create_checkout_session(payload: JoinPayload, request: Request):
             "quantity": 1,
         }],
         customer_email=payload.player_email,
-        success_url=f"{payload.success_url}?flow=join&session_id={{CHECKOUT_SESSION_ID}}&pot_id={pot_id}" + (f"&entry_id={payload.entry_id}" if payload.entry_id else ""),
-        cancel_url=f"{server_base(request)}/cancel-join?session_id={{CHECKOUT_SESSION_ID}}&pot_id={pot_id}&next={quote(payload.cancel_url)}" + (f"&entry_id={payload.entry_id}" if payload.entry_id else ""),
-        metadata=md,
+        success_url=f"{payload.success_url}?flow=join&session_id={{CHECKOUT_SESSION_ID}}&pot_id={pot_id}&entry_id={payload.entry_id}",
+        cancel_url=f"{server_base(request)}/cancel-join?session_id={{CHECKOUT_SESSION_ID}}&pot_id={pot_id}&entry_id={payload.entry_id}&next={quote(payload.cancel_url)}",
+        metadata={"flow": "join", "pot_id": pot_id, "entry_id": (payload.entry_id or ""), "player_email": payload.player_email or ""},
     )
 
-    # Record session mapping for cancel cleanup
-    db.collection("join_sessions").document(session["id"]).set({
-        "pot_id": pot_id,
-        **({"entry_id": payload.entry_id} if payload.entry_id else {}),
-        "createdAt": utcnow(),
-    }, merge=True)
-
+    db.collection("join_sessions").document(session["id"]).set({"pot_id": pot_id,"entry_id": (payload.entry_id or ""),"createdAt": utcnow()})
     return {"url": session.url, "session_id": session["id"]}
 
 @app.get("/cancel-join")
@@ -401,51 +399,19 @@ async def webhook(request: Request):
                 # Clean up draft
                 draft_ref.delete()
 
-        
         elif flow == "join":
             pot_id = (session.get("metadata") or {}).get("pot_id")
-            entry_id = (session.get("metadata") or {}).get("entry_id") or ""
-            player_name = (session.get("metadata") or {}).get("player_name") or "Player"
-            player_email = (session.get("metadata") or {}).get("player_email") or ""
-            if pot_id:
-                if entry_id:
-                    # Legacy path: entry already exists; just mark as paid
-                    entry_ref = db.collection("pots").document(pot_id).collection("entries").document(entry_id)
-                    entry_ref.set({
-                        "paid": True,
-                        "paid_amount": session.get("amount_total"),
-                        "paid_at": utcnow(),
-                        "payment_method": "stripe",
-                        "stripe_session_id": session["id"],
-                        "status": "active",
-                    }, merge=True)
-                else:
-                    # Entry-less flow: create the entry only after successful payment (no ghosts)
-                    entries_ref = db.collection("pots").document(pot_id).collection("entries")
-                    new_ref = entries_ref.document()
-                    entry_doc = {
-                        "name": player_name,
-                        "name_lc": player_name.lower(),
-                        "email": player_email,
-                        "email_lc": player_email.lower(),
-                        "member_type": None,
-                        "player_skill": None,
-                        "pay_type": "Stripe",
-                        "applied_buyin": round((session.get("amount_total") or 0) / 100, 2),
-                        "paid": True,
-                        "paid_amount": session.get("amount_total"),
-                        "paid_at": utcnow(),
-                        "payment_method": "stripe",
-                        "stripe_session_id": session["id"],
-                        "status": "active",
-                        "created_at": utcnow(),
-                    }
-                    new_ref.set(entry_doc, merge=True)
-                # Clean mapping
-                try:
-                    db.collection("join_sessions").document(session["id"]).delete()
-                except Exception:
-                    pass
+            entry_id = (session.get("metadata") or {}).get("entry_id")
+            if pot_id and entry_id:
+                entry_ref = db.collection("pots").document(pot_id).collection("entries").document(entry_id)
+                entry_ref.set({
+                    "paid": True,
+                    "paid_amount": session.get("amount_total"),
+                    "paid_at": utcnow(),
+                    "payment_method": "stripe",
+                    "stripe_session_id": session["id"],
+                }, merge=True)
+                db.collection("join_sessions").document(session["id"]).delete()
 
     return JSONResponse({"received": True})
 
