@@ -428,7 +428,6 @@ def create_status(session_id: str = Query(..., description="Stripe checkout sess
 def create_status2(session_id: str = Query(...)):
     return create_status(session_id=session_id)
 
-
 from fastapi import Request
 
 @app.post("/pots/{pot_id}/owner/entries/{entry_id}/toggle-paid")
