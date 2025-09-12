@@ -1,4 +1,3 @@
-
 from typing import List, Optional, Dict, Any
 from fastapi import APIRouter, HTTPException, Header
 from pydantic import BaseModel
@@ -52,7 +51,7 @@ def put_org_roster(org_id: str, payload: RosterUpdate, x_organizer_token: Option
 
 @router.get("/pots/{pot_id}/roster-resolved")
 def get_resolved_roster(pot_id: str, x_organizer_token: Optional[str] = Header(default=None), token: Optional[str] = None) -> Dict[str, Any]:
-    require_admin(x_organizer_token, token)
+    # PUBLIC READ: do NOT require admin for read-only roster resolution.
     ib = db.collection("pot_roster_inline").document(pot_id).get()
     if ib.exists:
         r = ib.to_dict() or {}

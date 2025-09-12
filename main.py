@@ -47,12 +47,15 @@ def server_base(request: Request) -> str:
     return f"{request.url.scheme}://{request.headers.get('host')}"
 
 def b64url_encode(b: bytes) -> str:
+    import base64
     return base64.urlsafe_b64encode(b).decode().rstrip("=")
 
 def b64url_decode(s: str) -> bytes:
+    import base64
     return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
 
 def random_owner_code(length_bytes: int = 5) -> str:
+    import base64
     code = base64.b32encode(secrets.token_bytes(length_bytes)).decode().rstrip("=")
     return code.replace("O","8").replace("I","9")
 
@@ -125,7 +128,8 @@ app.add_middleware(
     allow_origins=_origins if CORS_ALLOW != "*" else ["*"],
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization"],
+    # Include custom token header so browsers don't block preflight
+    allow_headers=["Content-Type", "Authorization", "X-Organizer-Token"],
     expose_headers=["*"],
 )
 
@@ -138,15 +142,14 @@ def health():
     return {"ok": True, "now": utcnow().isoformat()}
 
 # ------------------ Public list/search of Active Tournaments ------------------
+from fastapi import Query
+
 @app.get("/pots")
 def list_pots(q: Optional[str] = Query(None, description="search text"),
               limit: int = Query(50, ge=1, le=200)):
-    """Public endpoint: list active pots for browsing/joining. Anyone can call this."""
     try:
-        # Query active pots; order by createdAt desc if present
         pots = []
         query = db.collection("pots").where("status", "==", "active")
-        # Try to order by createdAt if indexed, otherwise fallback unordered
         try:
             stream = query.order_by("createdAt", direction=firestore.Query.DESCENDING).limit(limit*2).stream()
         except Exception:
@@ -182,7 +185,6 @@ async def create_pot_session(payload: CreatePotPayload, request: Request):
     if amount_cents < 50:
         raise HTTPException(400, "Minimum amount is 50 cents")
 
-    # stash the draft
     draft_ref = db.collection("pot_drafts").document()
     draft_ref.set({**draft, "status": "draft", "createdAt": utcnow()}, merge=True)
 
@@ -217,7 +219,6 @@ def cancel_create(session_id: str, next: str = "/"):
     draft_id = (snap.to_dict() or {}).get("draft_id") if snap.exists else None
     if draft_id:
         db.collection("pot_drafts").document(draft_id).delete()
-    # Remove any pots created under this session (belt and braces)
     try:
         for pot_doc in db.collection("pots").where("stripe_session_id", "==", session_id).stream():
             pot_doc.reference.delete()
@@ -239,13 +240,11 @@ class JoinPayload(BaseModel):
 @app.post("/create-checkout-session")
 async def create_checkout_session(payload: JoinPayload, request: Request):
     pot_id = payload.pot_id
-    # Validate required fields
     if not pot_id or not payload.entry_id:
         raise HTTPException(400, "Missing pot_id or entry_id")
     if payload.amount_cents < 50:
         raise HTTPException(400, "Minimum amount is 50 cents")
 
-    # Validate absolute URLs for Stripe redirects
     def _is_abs_http(u: str) -> bool:
         return isinstance(u, str) and (u.startswith("http://") or u.startswith("https://"))
     if not _is_abs_http(payload.success_url):
@@ -314,7 +313,6 @@ class OwnerAuth(BaseModel):
     code: Optional[str] = None
 
 def _require_owner(pot_id: str, auth: OwnerAuth):
-    # token (manage link) OR plaintext code
     if auth.key and verify_owner_token(pot_id, auth.key):
         return True
     if auth.code:
@@ -384,7 +382,6 @@ async def webhook(request: Request):
                 pots_payload = []
                 for _ in range(max(1, count)):
                     pot_id = db.collection("pots").document().id
-                    # create salt for owner token + owner code
                     initial_salt = b64url_encode(secrets.token_bytes(12))
                     code = random_owner_code()
 
@@ -416,14 +413,12 @@ async def webhook(request: Request):
                         "owner_code_plain_exp": now + OWNER_CODE_TTL_SECONDS,
                     })
 
-                # Write status doc for success page polling
                 db.collection("create_sessions").document(session["id"]).set({
                     "ready": True,
                     "updated_at": firestore.SERVER_TIMESTAMP,
                     "pots": pots_payload,
                 }, merge=True)
 
-                # Clean up draft
                 draft_ref.delete()
 
         elif flow == "join":
@@ -447,7 +442,6 @@ async def webhook(request: Request):
 def create_status(session_id: str = Query(..., description="Stripe checkout session id")):
     doc = db.collection("create_sessions").document(session_id).get()
     if not doc.exists:
-        # front-end will keep polling
         raise HTTPException(404, "not-ready")
 
     data = doc.to_dict() or {}
