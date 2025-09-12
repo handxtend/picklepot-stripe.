@@ -108,6 +108,41 @@ def _matches_query(p: dict, q: str) -> bool:
 
 # ------------------ FastAPI ------------------
 app = FastAPI(title="PicklePot Backend")
+
+# ---- CORS (explicit origins; handles preflight) ----
+from fastapi.middleware.cors import CORSMiddleware
+
+# Prefer env list (comma-separated) or fall back to dev + FRONTEND_BASE_URL
+_env = os.getenv("CORS_ALLOW") or os.getenv("CORS_ORIGINS")
+_default_frontend = os.getenv("FRONTEND_BASE_URL", "https://picklepotters.netlify.app")
+_origins = [o.strip() for o in (_env.split(",") if _env else []) if o.strip()]
+if not _origins:
+    _origins = ["http://localhost:5173", _default_frontend]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_origins,
+    allow_credentials=False,                   # set True only if you actually use cookies/auth
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+    expose_headers=["*"],
+)
+# -----------------------------------------------
+
+
+
+# ---- CORS (allow Netlify origin or *) ----
+from fastapi.middleware.cors import CORSMiddleware
+import os
+CORS_ALLOW = os.getenv("CORS_ALLOW") or os.getenv("CORS_ORIGINS") or "*"
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"] if (CORS_ALLOW == "*" or not CORS_ALLOW) else [o.strip() for o in CORS_ALLOW.split(",") if o.strip()],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"] if (CORS_ALLOW == "*" or not CORS_ALLOW) else [o.strip() for o in CORS_ALLOW.split(",") if o.strip()],
@@ -242,10 +277,10 @@ async def create_checkout_session(payload: JoinPayload, request: Request):
         customer_email=payload.player_email,
         success_url=f"{payload.success_url}?flow=join&session_id={{CHECKOUT_SESSION_ID}}&pot_id={pot_id}&entry_id={payload.entry_id}",
         cancel_url=f"{server_base(request)}/cancel-join?session_id={{CHECKOUT_SESSION_ID}}&pot_id={pot_id}&entry_id={payload.entry_id}&next={quote(payload.cancel_url)}",
-        metadata={"flow": "join", "pot_id": pot_id, "entry_id": payload.entry_id, "player_email": payload.player_email or ""},
+        metadata={"flow": "join", "pot_id": pot_id, "entry_id": (payload.entry_id or ""), "player_email": payload.player_email or ""},
     )
 
-    db.collection("join_sessions").document(session["id"]).set({"pot_id": pot_id,"entry_id": payload.entry_id,"createdAt": utcnow()})
+    db.collection("join_sessions").document(session["id"]).set({"pot_id": pot_id,"entry_id": (payload.entry_id or ""),"createdAt": utcnow()})
     return {"url": session.url, "session_id": session["id"]}
 
 @app.get("/cancel-join")
