@@ -107,15 +107,13 @@ def _matches_query(p: dict, q: str) -> bool:
     return False
 
 # ------------------ FastAPI ------------------
-\1
+app = FastAPI(title="Picklepot API", version="1.0.0")
+
 # --- Roster API Addon ---
 from server_roster_api_addon import router as roster_router
 app.include_router(roster_router, prefix="/api")
 
 # ---- CORS (explicit origins; handles preflight) ----
-from fastapi.middleware.cors import CORSMiddleware
-
-# Prefer env list (comma-separated) or fall back to dev + FRONTEND_BASE_URL
 _env = os.getenv("CORS_ALLOW") or os.getenv("CORS_ORIGINS")
 _default_frontend = os.getenv("FRONTEND_BASE_URL", "https://picklepotters.netlify.app")
 _origins = [o.strip() for o in (_env.split(",") if _env else []) if o.strip()]
@@ -124,20 +122,11 @@ if not _origins:
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_origins,
-    allow_credentials=False,                   # set True only if you actually use cookies/auth
+    allow_origins=_origins if CORS_ALLOW != "*" else ["*"],
+    allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization"],
     expose_headers=["*"],
-)
-# -----------------------------------------------
-
-
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"] if (CORS_ALLOW == "*" or not CORS_ALLOW) else [o.strip() for o in CORS_ALLOW.split(",") if o.strip()],
-    allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
 @app.get("/", include_in_schema=False)
@@ -247,7 +236,6 @@ class JoinPayload(BaseModel):
     player_name: Optional[str] = "Player"
     player_email: Optional[str] = None
 
-
 @app.post("/create-checkout-session")
 async def create_checkout_session(payload: JoinPayload, request: Request):
     pot_id = payload.pot_id
@@ -300,31 +288,6 @@ async def create_checkout_session(payload: JoinPayload, request: Request):
         raise HTTPException(400, msg)
     except Exception as e:
         raise HTTPException(500, f"Server error creating checkout session: {e}")
-
-    pot_id = payload.pot_id
-    if not pot_id or not payload.entry_id:
-        raise HTTPException(400, "Missing pot_id or entry_id")
-    if payload.amount_cents < 50:
-        raise HTTPException(400, "Minimum amount is 50 cents")
-
-    session = stripe.checkout.Session.create(
-        mode="payment",
-        line_items=[{
-            "price_data": {
-                "currency": "usd",
-                "product_data": {"name": f"Join Pot — {payload.player_name or 'Player'}"},
-                "unit_amount": int(payload.amount_cents),
-            },
-            "quantity": 1,
-        }],
-        customer_email=payload.player_email,
-        success_url=f"{payload.success_url}?flow=join&session_id={{CHECKOUT_SESSION_ID}}&pot_id={pot_id}&entry_id={payload.entry_id}",
-        cancel_url=f"{server_base(request)}/cancel-join?session_id={{CHECKOUT_SESSION_ID}}&pot_id={pot_id}&entry_id={payload.entry_id}&next={quote(payload.cancel_url)}",
-        metadata={"flow": "join", "pot_id": pot_id, "entry_id": (payload.entry_id or ""), "player_email": payload.player_email or ""},
-    )
-
-    db.collection("join_sessions").document(session["id"]).set({"pot_id": pot_id,"entry_id": (payload.entry_id or ""),"createdAt": utcnow()})
-    return {"url": session.url, "session_id": session["id"]}
 
 @app.get("/cancel-join")
 def cancel_join(session_id: str, pot_id: Optional[str] = None, entry_id: Optional[str] = None, next: str = "/"):
