@@ -107,7 +107,10 @@ def _matches_query(p: dict, q: str) -> bool:
     return False
 
 # ------------------ FastAPI ------------------
-app = FastAPI(title="PicklePot Backend")
+\1
+# --- Roster API Addon ---
+from server_roster_api_addon import router as roster_router
+app.include_router(roster_router, prefix="/api")
 
 # ---- CORS (explicit origins; handles preflight) ----
 from fastapi.middleware.cors import CORSMiddleware
