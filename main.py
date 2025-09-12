@@ -131,6 +131,12 @@ app.add_middleware(
 
 
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"] if (CORS_ALLOW == "*" or not CORS_ALLOW) else [o.strip() for o in CORS_ALLOW.split(",") if o.strip()],
+    allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
+)
+
 @app.get("/", include_in_schema=False)
 def root():
     return {"ok": True}
@@ -238,15 +244,67 @@ class JoinPayload(BaseModel):
     player_name: Optional[str] = "Player"
     player_email: Optional[str] = None
 
+
 @app.post("/create-checkout-session")
 async def create_checkout_session(payload: JoinPayload, request: Request):
+    pot_id = payload.pot_id
+    # Validate required fields
+    if not pot_id or not payload.entry_id:
+        raise HTTPException(400, "Missing pot_id or entry_id")
+    if payload.amount_cents < 50:
+        raise HTTPException(400, "Minimum amount is 50 cents")
+
+    # Validate absolute URLs for Stripe redirects
+    def _is_abs_http(u: str) -> bool:
+        return isinstance(u, str) and (u.startswith("http://") or u.startswith("https://"))
+    if not _is_abs_http(payload.success_url):
+        raise HTTPException(400, "Invalid success_url (must be absolute http/https)")
+    if not _is_abs_http(payload.cancel_url):
+        raise HTTPException(400, "Invalid cancel_url (must be absolute http/https)")
+
+    try:
+        session = stripe.checkout.Session.create(
+            mode="payment",
+            line_items=[{
+                "price_data": {
+                    "currency": "usd",
+                    "product_data": {"name": f"Join Pot — {payload.player_name or 'Player'}"},
+                    "unit_amount": int(payload.amount_cents),
+                },
+                "quantity": 1,
+            }],
+            customer_email=payload.player_email,
+            success_url=f"{payload.success_url}?flow=join&session_id={{CHECKOUT_SESSION_ID}}&pot_id={pot_id}&entry_id={payload.entry_id}",
+            cancel_url=f"{server_base(request)}/cancel-join?session_id={{CHECKOUT_SESSION_ID}}&pot_id={pot_id}&entry_id={payload.entry_id}&next={quote(payload.cancel_url)}",
+            metadata={
+                "flow": "join",
+                "pot_id": pot_id,
+                "entry_id": (payload.entry_id or ""),
+                "player_email": payload.player_email or "",
+            },
+        )
+
+        db.collection("join_sessions").document(session["id"]).set({
+            "pot_id": pot_id,
+            "entry_id": (payload.entry_id or ""),
+            "createdAt": utcnow()
+        })
+
+        return {"url": session.url, "session_id": session["id"]}
+
+    except stripe.error.StripeError as e:
+        msg = getattr(e, "user_message", None) or str(e) or "Stripe error"
+        raise HTTPException(400, msg)
+    except Exception as e:
+        raise HTTPException(500, f"Server error creating checkout session: {e}")
+
     pot_id = payload.pot_id
     if not pot_id or not payload.entry_id:
         raise HTTPException(400, "Missing pot_id or entry_id")
     if payload.amount_cents < 50:
         raise HTTPException(400, "Minimum amount is 50 cents")
 
-                session = stripe.checkout.Session.create(
+    session = stripe.checkout.Session.create(
         mode="payment",
         line_items=[{
             "price_data": {
@@ -262,16 +320,8 @@ async def create_checkout_session(payload: JoinPayload, request: Request):
         metadata={"flow": "join", "pot_id": pot_id, "entry_id": (payload.entry_id or ""), "player_email": payload.player_email or ""},
     )
 
-    
     db.collection("join_sessions").document(session["id"]).set({"pot_id": pot_id,"entry_id": (payload.entry_id or ""),"createdAt": utcnow()})
     return {"url": session.url, "session_id": session["id"]}
-except stripe.error.StripeError as e:
-    # Forward human-friendly message to the client
-    msg = getattr(e, "user_message", None) or str(e) or "Stripe error"
-    raise HTTPException(400, msg)
-except Exception as e:
-    # Unexpected server error
-    raise HTTPException(500, f"Server error creating checkout session: {e}")
 
 @app.get("/cancel-join")
 def cancel_join(session_id: str, pot_id: Optional[str] = None, entry_id: Optional[str] = None, next: str = "/"):
