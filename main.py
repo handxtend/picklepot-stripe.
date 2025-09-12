@@ -131,24 +131,6 @@ app.add_middleware(
 
 
 
-# ---- CORS (allow Netlify origin or *) ----
-from fastapi.middleware.cors import CORSMiddleware
-import os
-CORS_ALLOW = os.getenv("CORS_ALLOW") or os.getenv("CORS_ORIGINS") or "*"
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"] if (CORS_ALLOW == "*" or not CORS_ALLOW) else [o.strip() for o in CORS_ALLOW.split(",") if o.strip()],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["*"],
-)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"] if (CORS_ALLOW == "*" or not CORS_ALLOW) else [o.strip() for o in CORS_ALLOW.split(",") if o.strip()],
-    allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
-)
-
 @app.get("/", include_in_schema=False)
 def root():
     return {"ok": True}
@@ -264,7 +246,7 @@ async def create_checkout_session(payload: JoinPayload, request: Request):
     if payload.amount_cents < 50:
         raise HTTPException(400, "Minimum amount is 50 cents")
 
-    session = stripe.checkout.Session.create(
+                session = stripe.checkout.Session.create(
         mode="payment",
         line_items=[{
             "price_data": {
@@ -280,8 +262,16 @@ async def create_checkout_session(payload: JoinPayload, request: Request):
         metadata={"flow": "join", "pot_id": pot_id, "entry_id": (payload.entry_id or ""), "player_email": payload.player_email or ""},
     )
 
+    
     db.collection("join_sessions").document(session["id"]).set({"pot_id": pot_id,"entry_id": (payload.entry_id or ""),"createdAt": utcnow()})
     return {"url": session.url, "session_id": session["id"]}
+except stripe.error.StripeError as e:
+    # Forward human-friendly message to the client
+    msg = getattr(e, "user_message", None) or str(e) or "Stripe error"
+    raise HTTPException(400, msg)
+except Exception as e:
+    # Unexpected server error
+    raise HTTPException(500, f"Server error creating checkout session: {e}")
 
 @app.get("/cancel-join")
 def cancel_join(session_id: str, pot_id: Optional[str] = None, entry_id: Optional[str] = None, next: str = "/"):
